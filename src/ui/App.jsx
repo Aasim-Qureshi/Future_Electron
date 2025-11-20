@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import './index.css'; // Add this line
 import Layout from './components/Layout';
+
 import LoginForm from './screens/LoginForm';
 import CheckBrowser from './screens/CheckBrowser';
-import './index.css'; // Add this line
+import ValidateReport from './screens/ValidateReport';
 
 
 
@@ -14,12 +16,13 @@ const App = () => {
         switch (currentView) {
             case 'login':
                 return <LoginForm />;
+
             case 'check-status':
                 return <CheckBrowser />;
-            case 'automation':
-                return <Automation />;
-            case 'settings':
-                return <Settings />;
+
+            case 'validate-report':
+                return <ValidateReport />;
+
             default:
                 return <LoginForm />;
         }

@@ -1,10 +1,9 @@
-import asyncio
-import sys
-import json
-import traceback
-import platform
+import asyncio, sys, json, traceback, platform
+
 from .browser import closeBrowser, get_browser, check_browser_status
+
 from scripts.loginFlow.login import startLogin, submitOtp
+from scripts.submission.validateReport import validate_report
 
 if platform.system().lower() == "windows":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -55,6 +54,12 @@ async def command_handler():
                 result = await check_browser_status()
                 result["commandId"] = cmd.get("commandId")
                 
+                print(json.dumps(result), flush=True)
+
+            elif action == "validate-report":
+                result = await validate_report(cmd)
+                result["commandId"] = cmd.get("commandId")
+
                 print(json.dumps(result), flush=True)
                 
             elif action == "close":

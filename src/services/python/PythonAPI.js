@@ -1,10 +1,14 @@
 const PythonWorkerService = require('./PythonWorkerService');
+
 const AuthCommands = require('./commands/AuthCommands');
+const ReportCommands = require('./commands/ReportCommands');
 
 class PythonAPI {
     constructor() {
         this.workerService = new PythonWorkerService();
+
         this.auth = new AuthCommands(this.workerService);
+        this.report = new ReportCommands(this.workerService);
     }
 
     async startWorker() {

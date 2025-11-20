@@ -308,6 +308,7 @@ class PythonWorkerService {
                         response.status === 'OTP_REQUIRED' ||
                         response.status === 'LOGIN_SUCCESS' ||
                         response.status === 'NOT_LOGGED_IN' ||
+                        response.status === 'MACROS_EXIST' ||
                         response.status === 'NOT_FOUND') {
                         handler.resolve(response);
                     } else {

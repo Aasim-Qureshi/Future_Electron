@@ -8,5 +8,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
     login: (credentials) => ipcRenderer.invoke('login', credentials),
     submitOtp: (otp) => ipcRenderer.invoke('submit-otp', otp),
-    checkStatus: () => ipcRenderer.invoke('check-status')
+    checkStatus: () => ipcRenderer.invoke('check-status'),
+
+    validateReport: (reportId) => ipcRenderer.invoke('validate-report', reportId),
 });
