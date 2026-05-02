@@ -1,6 +1,37 @@
 const { app, BrowserWindow, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const dotenv = require("dotenv");
+
+(function loadLocalEnvFile() {
+  const candidates = [
+    path.join(__dirname, "..", ".env"),
+    path.join(process.cwd(), ".env"),
+  ];
+  try {
+    if (app.isPackaged) {
+      candidates.unshift(path.join(process.resourcesPath, ".env"));
+    }
+  } catch (_) {
+    /* ignore */
+  }
+  for (const envPath of candidates) {
+    try {
+      if (fs.existsSync(envPath)) {
+        dotenv.config({ path: envPath });
+        console.log("[MAIN] Loaded environment file:", envPath);
+        return;
+      }
+    } catch (err) {
+      console.warn(
+        "[MAIN] Failed loading .env:",
+        envPath,
+        err && err.message ? err.message : err,
+      );
+    }
+  }
+})();
+
 const http = require("http");
 const https = require("https");
 const { registerIpcHandlers, unregisterIpcHandlers } = require("./ipc");

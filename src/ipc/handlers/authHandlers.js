@@ -2,7 +2,7 @@ const { session, BrowserWindow, shell } = require('electron');
 const pythonAPI = require('../../services/python/PythonAPI');
 
 const { TAQEEM_ELECTRON_PARTITION } = require('../../shared/constants/taqeemElectronPartition');
-const taqeemSecondaryCredentials = require('../../shared/constants/taqeemSecondaryCredentials');
+const { getTaqeemSecondaryCredentials } = require('../../shared/constants/taqeemSecondaryCredentials');
 let secondaryLoginWindow = null;
 const SECONDARY_PARTITION = TAQEEM_ELECTRON_PARTITION;
 const TAQEEM_APP_HOME_URL = 'https://qima.taqeem.gov.sa/';
@@ -175,10 +175,15 @@ function shouldOfferTaqeemLoginAssist(url) {
 }
 
 async function runTaqeemLoginAssist(webContents) {
-    const loginId = taqeemSecondaryCredentials.TAQEEM_SECONDARY_LOGIN_ID;
-    const password = taqeemSecondaryCredentials.TAQEEM_SECONDARY_PASSWORD;
+    const { loginId, password } = getTaqeemSecondaryCredentials();
     const loginIdJson = JSON.stringify(loginId);
     const passwordJson = JSON.stringify(password);
+
+    if (!loginId || !password) {
+        console.warn(
+            '[MAIN] Taqeem secondary credentials missing. Set TAQEEM_SECONDARY_LOGIN_ID and TAQEEM_SECONDARY_PASSWORD in .env (project root) and restart the app.',
+        );
+    }
 
     await webContents.executeJavaScript(`
         (function () {
@@ -186,25 +191,34 @@ async function runTaqeemLoginAssist(webContents) {
             var PASSWORD = ${passwordJson};
             function pickUser() {
                 return document.querySelector(
-                    '#username, input[name="username"], input[name="login"], input#username, input[type="text"][autocomplete="username"]'
+                    'input#username, input[name="username"], input[name="login"], input[type="text"][autocomplete="username"]'
                 );
             }
             function pickPass() {
-                return document.querySelector('#password, input[name="password"], input[type="password"]');
+                return document.querySelector(
+                    'input#password, input[name="password"], input[type="password"]'
+                );
             }
             var userEl = pickUser();
             var passEl = pickPass();
-            if (userEl) {
+            if (userEl && LOGIN_ID) {
                 userEl.focus();
                 userEl.value = LOGIN_ID;
                 userEl.dispatchEvent(new Event('input', { bubbles: true }));
                 userEl.dispatchEvent(new Event('change', { bubbles: true }));
+                userEl.dispatchEvent(new Event('blur', { bubbles: true }));
             }
-            if (passEl) {
+            if (passEl && PASSWORD) {
                 passEl.value = PASSWORD;
                 passEl.dispatchEvent(new Event('input', { bubbles: true }));
                 passEl.dispatchEvent(new Event('change', { bubbles: true }));
             }
+            try {
+                var scrollEl = userEl || passEl;
+                if (scrollEl && scrollEl.scrollIntoView) {
+                    scrollEl.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+                }
+            } catch (e) { /* ignore */ }
             var HID = 'vt-taqeem-secondary-cred-panel';
             var old = document.getElementById(HID);
             if (old) old.remove();
@@ -212,10 +226,10 @@ async function runTaqeemLoginAssist(webContents) {
             panel.id = HID;
             panel.setAttribute('dir', 'rtl');
             panel.style.cssText = [
-                'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
-                'font-family:system-ui,Segoe UI,Tahoma,sans-serif', 'font-size:13px',
-                'background:#1a2744', 'color:#e8eefc', 'padding:10px 14px', 'text-align:center',
-                'box-shadow:0 2px 8px rgba(0,0,0,0.35)', 'line-height:1.55'
+                'position:fixed', 'bottom:0', 'left:0', 'right:0', 'z-index:2147483647',
+                'font-family:system-ui,Segoe UI,Tahoma,sans-serif', 'font-size:12px',
+                'background:#1a2744', 'color:#e8eefc', 'padding:10px 14px 12px', 'text-align:center',
+                'box-shadow:0 -4px 12px rgba(0,0,0,0.35)', 'line-height:1.55', 'max-height:38vh', 'overflow-y:auto'
             ].join(';');
             var title = document.createElement('strong');
             title.textContent = 'تسجيل دخول اعتماد التقارير (النافذة الثانوية)';
@@ -223,14 +237,15 @@ async function runTaqeemLoginAssist(webContents) {
             titleWrap.appendChild(title);
             var line = document.createElement('div');
             line.style.marginTop = '6px';
-            line.textContent =
-                'الهوية / الإقامة / البريد: ' + LOGIN_ID + ' — كلمة المرور: ' + PASSWORD;
+            var idLabel = LOGIN_ID ? LOGIN_ID : '(غير مضبوط — أضف TAQEEM_SECONDARY_LOGIN_ID في .env)';
+            var passLabel = PASSWORD ? '••••••••' : '(غير مضبوط — أضف TAQEEM_SECONDARY_PASSWORD في .env)';
+            line.textContent = 'الهوية / الإقامة / البريد: ' + idLabel + ' — كلمة المرور: ' + passLabel;
             var hint = document.createElement('div');
             hint.style.marginTop = '6px';
-            hint.style.fontSize = '12px';
+            hint.style.fontSize = '11px';
             hint.style.opacity = '0.92';
             hint.textContent =
-                'تم تعبئة الحقول تلقائياً عند الحاجة؛ أكمل أي خطوة يدوية (مثل التحقق بخطوتين). بعد أول دخول ناجح تُحفظ الجلسة في هذا المتصفح حتى لو أُغلقت النافذة.';
+                'تم تعبئة الحقول تلقائياً عند توفر القيم في .env؛ أكمل أي خطوة يدوية (مثل التحقق بخطوتين). بعد أول دخول ناجح تُحفظ الجلسة في هذا المتصفح.';
             panel.appendChild(titleWrap);
             panel.appendChild(line);
             panel.appendChild(hint);
