@@ -1,47 +1,29 @@
-const SUPER_ADMIN_PHONE = '000';
+const SUPER_ADMIN_PHONE = "000";
 
-const UPLOAD_SINGLE_REPORT_VIEW_IDS = [
-    'macro-edit',
-    'grab-macro-ids',
-    'common-fields',
-    'upload-excel',
-    'asset-create',
-    'validate-report'
-];
+/** @deprecated Single-mode app: no extra view restrictions */
+const ADMIN_ONLY_VIEW_IDS = new Set();
 
-const ADMIN_ONLY_VIEW_IDS = new Set([
-    'upload-report-elrajhi',
-    ...UPLOAD_SINGLE_REPORT_VIEW_IDS
-]);
+const UPLOAD_SINGLE_REPORT_VIEW_IDS = [];
 
-const isSuperAdminUser = (user) => String(user?.phone || '').trim() === SUPER_ADMIN_PHONE;
+const isSuperAdminUser = (user) =>
+  String(user?.phone || "").trim() === SUPER_ADMIN_PHONE;
 
-const canAccessView = (viewId, user) => {
-    if (!viewId) return true;
-    if (!ADMIN_ONLY_VIEW_IDS.has(viewId)) return true;
-    return isSuperAdminUser(user);
-};
+const canAccessView = () => true;
 
-const canAccessGroup = (groupId, user) => {
-    if (groupId === 'uploadSingleReport') {
-        return isSuperAdminUser(user);
-    }
-    return true;
-};
+const canAccessGroup = () => true;
 
-const filterTabsByAccess = (tabs = [], user) =>
-    (Array.isArray(tabs) ? tabs : []).filter((tab) => canAccessView(tab?.id, user));
+const filterTabsByAccess = (tabs = []) => (Array.isArray(tabs) ? tabs : []);
 
-const getFirstAccessibleTabId = (tabs = [], user) =>
-    filterTabsByAccess(tabs, user)[0]?.id || null;
+const getFirstAccessibleTabId = (tabs = []) =>
+  (Array.isArray(tabs) ? tabs : [])[0]?.id || null;
 
 export {
-    SUPER_ADMIN_PHONE,
-    UPLOAD_SINGLE_REPORT_VIEW_IDS,
-    ADMIN_ONLY_VIEW_IDS,
-    isSuperAdminUser,
-    canAccessView,
-    canAccessGroup,
-    filterTabsByAccess,
-    getFirstAccessibleTabId
+  SUPER_ADMIN_PHONE,
+  ADMIN_ONLY_VIEW_IDS,
+  UPLOAD_SINGLE_REPORT_VIEW_IDS,
+  isSuperAdminUser,
+  canAccessView,
+  canAccessGroup,
+  filterTabsByAccess,
+  getFirstAccessibleTabId,
 };

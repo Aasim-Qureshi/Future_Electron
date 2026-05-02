@@ -1,14 +1,16 @@
 import asyncio
 import json
+import sys
 import traceback
 from datetime import datetime, timezone
 
-from scripts.core.browser import spawn_new_browser
 from scripts.core.httpClient import http_get, http_patch
 from scripts.core.utils import wait_for_element, wait_for_table_rows
 from scripts.submission.ElRajhiFiller import (
+    complete_macro_report,
     extract_asset_from_report,
-    finalize_report_submission,
+    is_macro_fill_failed,
+    open_workflow_page,
 )
 
 from .formSteps import macro_form_config
@@ -168,6 +170,11 @@ async def _check_single_report(page, report):
 
 
 async def check_elrajhi_batches(browser, batch_id=None, tabs_num=3):
+    print(
+        f"[PY] ElRajhiChecker: starting batch status check batch_id={batch_id} tabs={tabs_num}",
+        file=sys.stderr,
+        flush=True,
+    )
     report_data = await http_get(f"/new-scripts/batch/{batch_id}")
     reports = report_data.get("reports", [])
 
@@ -179,59 +186,114 @@ async def check_elrajhi_batches(browser, batch_id=None, tabs_num=3):
             else "No reports found",
         }
 
-    new_browser = await spawn_new_browser(browser)
-    tabs = min(len(reports), tabs_num)
-    main_page = new_browser.main_tab
-
-    pages = [main_page]
+    workflow_browser = None
+    main_page = None
+    new_browser = None
+    pages = []
     try:
+        workflow_browser, main_page, new_browser = await open_workflow_page(
+            browser,
+            force_spawn=True,
+        )
+        if workflow_browser is None or main_page is None:
+            return {
+                "status": "FAILED",
+                "error": "Could not open Taqeem action browser.",
+            }
+
+        print(
+            f"[PY] ElRajhiChecker: action browser ready; checking {len(reports)} report(s)",
+            file=sys.stderr,
+            flush=True,
+        )
+
         tabs = min(len(reports), tabs_num)
-        pages = [main_page] + [
-            await new_browser.get("about:blank", new_tab=True)
-            for _ in range(max(0, tabs - 1))
-        ]
-    except Exception:
-        pages = []
+        pages = [main_page]
+        try:
+            extra_pages = []
+            for _ in range(max(0, tabs - 1)):
+                try:
+                    extra_pages.append(
+                        await asyncio.wait_for(
+                            workflow_browser.get("about:blank", new_tab=True),
+                            timeout=30.0,
+                        )
+                    )
+                except Exception:
+                    break
+            pages = [main_page] + extra_pages
+        except Exception:
+            pages = [main_page]
 
-    chunks = chunk_items(reports, len(pages))
-    results = []
+        chunks = chunk_items(reports, len(pages))
+        results = []
 
-    async def process_chunk(page, chunk):
-        for rep in chunk:
-            res = await _check_single_report(page, rep)
-            print(json.dumps({"event": "elrajhi-check", **res}), flush=True)
-            results.append(res)
+        async def process_chunk(page, chunk):
+            for rep in chunk:
+                try:
+                    res = await asyncio.wait_for(
+                        _check_single_report(page, rep),
+                        timeout=75.0,
+                    )
+                except asyncio.TimeoutError:
+                    res = {
+                        "batchId": rep.get("batch_id") or batch_id,
+                        "reportId": rep.get("report_id"),
+                        "status": "FAILED",
+                        "error": "Status check timed out for this report",
+                        "client_name": rep.get("client_name"),
+                        "asset_name": rep.get("asset_name"),
+                    }
+                except Exception as err:
+                    res = {
+                        "batchId": rep.get("batch_id") or batch_id,
+                        "reportId": rep.get("report_id"),
+                        "status": "FAILED",
+                        "error": str(err) or type(err).__name__,
+                        "client_name": rep.get("client_name"),
+                        "asset_name": rep.get("asset_name"),
+                    }
+                print(json.dumps({"event": "elrajhi-check", **res}), flush=True)
+                results.append(res)
 
-    await asyncio.gather(*(process_chunk(p, c) for p, c in zip(pages, chunks)))
+        await asyncio.gather(*(process_chunk(p, c) for p, c in zip(pages, chunks)))
 
-    grouped = {}
-    for item in results:
-        key = item.get("batchId") or batch_id or "unknown"
-        grouped.setdefault(key, {"batchId": key, "reports": []})
-        grouped[key]["reports"].append(item)
+        grouped = {}
+        for item in results:
+            key = item.get("batchId") or batch_id or "unknown"
+            grouped.setdefault(key, {"batchId": key, "reports": []})
+            grouped[key]["reports"].append(item)
 
-    for group in grouped.values():
-        sent = 0
-        confirmed = 0
-        complete = 0
+        for group in grouped.values():
+            sent = 0
+            confirmed = 0
+            complete = 0
 
-        for r in group["reports"]:
-            status = (r.get("status") or "").upper()
-            if status == "SENT":
-                sent += 1
-            if status == "CONFIRMED":
-                confirmed += 1
-            if status in ("COMPLETE", "SENT", "CONFIRMED"):
-                complete += 1
+            for r in group["reports"]:
+                status = (r.get("status") or "").upper()
+                if status == "SENT":
+                    sent += 1
+                if status == "CONFIRMED":
+                    confirmed += 1
+                if status in ("COMPLETE", "SENT", "CONFIRMED"):
+                    complete += 1
 
-        group["complete"] = complete
-        group["sent"] = sent
-        group["confirmed"] = confirmed
-        group["total"] = len(group["reports"])
-        group["incomplete"] = group["total"] - complete
+            group["complete"] = complete
+            group["sent"] = sent
+            group["confirmed"] = confirmed
+            group["total"] = len(group["reports"])
+            group["incomplete"] = group["total"] - complete
 
-    new_browser.stop()
-    return {"status": "SUCCESS", "batches": list(grouped.values())}
+        return {"status": "SUCCESS", "batches": list(grouped.values())}
+    finally:
+        if new_browser:
+            new_browser.stop()
+        else:
+            for page in pages:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
 
 async def reupload_elrajhi_report(browser, report_id):
@@ -247,8 +309,21 @@ async def reupload_elrajhi_report(browser, report_id):
             "error": f"Report {report_id} not found in database",
         }
 
+    new_browser = None
+    action_page = None
     try:
-        page = await browser.get(f"https://qima.taqeem.gov.sa/report/{report_id}")
+        workflow_browser, page, new_browser = await open_workflow_page(
+            browser,
+            force_spawn=True,
+        )
+        if workflow_browser is None or page is None:
+            return {
+                "status": "FAILED",
+                "error": "Could not open Taqeem action browser.",
+            }
+        action_page = page
+
+        await page.get(f"https://qima.taqeem.gov.sa/report/{report_id}")
         await asyncio.sleep(1)
 
         macro_link = await wait_for_element(
@@ -268,22 +343,53 @@ async def reupload_elrajhi_report(browser, report_id):
             field_types=macro_form_config["field_types"],
         )
 
-        finalize_result = await finalize_report_submission(page, report_id)
-        submit_state = 1 if finalize_result.get("status") == "SUCCESS" else 0
-        status_value = "COMPLETE" if submit_state else "INCOMPLETE"
+        if is_macro_fill_failed(macro_result):
+            await _mark_submit_state(report, 0, "INCOMPLETE")
+            return {
+                "status": "FAILED",
+                "reportId": report_id,
+                "macroId": macro_id,
+                "submitState": 0,
+                "reportStatus": "INCOMPLETE",
+                "macroResult": macro_result,
+            }
 
-        await _mark_submit_state(report, submit_state, status_value)
+        completion_result = await complete_macro_report(
+            page,
+            {
+                "macro_id": macro_id,
+                "macro_data": macro_data,
+                "report_id": report_id,
+                "record_id": str(report["_id"]),
+            },
+            True,
+        )
+
+        submit_state = 1
+        status_value = (
+            "SENT" if completion_result.get("finalization_succeeded") else "COMPLETE"
+        )
 
         return {
-            "status": "SUCCESS" if submit_state else "FAILED",
+            "status": "SUCCESS"
+            if completion_result.get("finalization_succeeded")
+            else "FAILED",
             "reportId": report_id,
             "macroId": macro_id,
             "submitState": submit_state,
             "reportStatus": status_value,
             "macroResult": macro_result,
-            "finalize": finalize_result,
+            "finalize": completion_result.get("finalization"),
         }
     except Exception as e:
         tb = traceback.format_exc()
         await _mark_submit_state(report, 0, "INCOMPLETE")
         return {"status": "FAILED", "error": str(e), "traceback": tb}
+    finally:
+        if new_browser:
+            new_browser.stop()
+        elif action_page is not None:
+            try:
+                await action_page.close()
+            except Exception:
+                pass

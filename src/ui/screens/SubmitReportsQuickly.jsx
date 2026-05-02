@@ -38,10 +38,14 @@ import {
   updateSubmitReportsQuickly,
   deleteSubmitReportsQuickly,
 } from "../../api/report";
-import { ensureTaqeemAuthorized } from "../../shared/helper/taqeemAuthWrap";
+import {
+  ensureTaqeemAuthorized,
+  extractTaqeemUsernameFromUser,
+} from "../../shared/helper/taqeemAuthWrap";
 import { deductPoints } from "../utils/points";
 import { downloadTemplateFile } from "../utils/templateDownload";
 import { useValueNav } from "../context/ValueNavContext";
+import { recordUploadBatch } from "../utils/reportUploadStats";
 import excelIconFallback from "../../../public/images/excelicon.png";
 
 const DUMMY_PDF_NAME = "dummy_placeholder.pdf";
@@ -859,7 +863,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     ensureCompaniesLoaded,
     setSelectedCompany,
   } = useValueNav();
-  const isGuestUser = isGuest || !user?.phone;
+  const taqeemLinked = Boolean(extractTaqeemUsernameFromUser(user || {}));
   const selectedCompanyOfficeId = useMemo(() => {
     const officeId = selectedCompany?.officeId || selectedCompany?.office_id;
     return officeId ? String(officeId) : "";
@@ -902,7 +906,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
   const [validationTableTab, setValidationTableTab] = useState("assets");
   const [showValidationModal, setShowValidationModal] = useState(false);
   const [validationModalStep, setValidationModalStep] = useState("validation");
-  const [showTemporaryModal, setShowTemporaryModal] = useState(false);
   const [showInsufficientPointsModal, setShowInsufficientPointsModal] =
     useState(false);
   const [insufficientPointsMeta, setInsufficientPointsMeta] = useState(null);
@@ -921,8 +924,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     { storage: "session" },
   );
   const [reportsLoading, setReportsLoading] = useState(false);
-  const [unassignedReports, setUnassignedReports] = useState([]);
-  const [unassignedLoading, setUnassignedLoading] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage, setItemsPerPage] = useState(10);
   const [expandedReports, setExpandedReports] = useState([]);
@@ -940,12 +941,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     ...DEFAULT_REPORT_INFO_FORM,
   });
   const [excelIconSrc, setExcelIconSrc] = useState(excelIconFallback);
-
-  useEffect(() => {
-    if (!isGuestUser && showTemporaryModal) {
-      setShowTemporaryModal(false);
-    }
-  }, [isGuestUser, showTemporaryModal]);
 
   const excelInputRef = useRef(null);
   const pdfInputRef = useRef(null);
@@ -1065,43 +1060,19 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     return paths;
   };
 
-  const ensureGuestSession = async () => {
+  const resolveActiveApiToken = async () => {
     if (token) return token;
-    if (!window?.electronAPI?.apiRequest) {
-      throw new Error("Desktop integration unavailable. Restart the app.");
-    }
-
     const tokenObj = await window.electronAPI.getToken?.();
     const bearer = tokenObj?.refreshToken || tokenObj?.token;
-    const headers = bearer ? { Authorization: `Bearer ${bearer}` } : {};
-
-    const result = await window.electronAPI.apiRequest(
-      "POST",
-      "/api/users/guest",
-      {},
-      headers,
-    );
-    if (!result?.token || !result?.userId) {
+    if (!bearer) {
       throw new Error(
-        result?.message || result?.error || "Failed to create guest session.",
+        translate(
+          "messages.error.noApiToken",
+          "No login session. Restart the app or wait for connection.",
+        ),
       );
     }
-
-    if (result?.refreshToken && window.electronAPI?.setRefreshToken) {
-      try {
-        await window.electronAPI.setRefreshToken(result.refreshToken, {
-          name: "refreshToken",
-          maxAgeDays: 7,
-          sameSite: "lax",
-        });
-      } catch (err) {
-        console.warn("Failed to set refresh token for guest session:", err);
-      }
-    }
-
-    const guestUser = { _id: result.userId, id: result.userId, guest: true };
-    login(guestUser, result.token);
-    return result.token;
+    return bearer;
   };
 
   const mergeReports = useCallback((existing = [], incoming = []) => {
@@ -1208,7 +1179,24 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
         );
       }
 
-      const activeToken = await ensureGuestSession();
+      if (!extractTaqeemUsernameFromUser(user || {})) {
+        throw new Error(
+          translate(
+            "messages.error.taqeemRequiredForUpload",
+            "Log in to Taqeem and link your account before uploading reports.",
+          ),
+        );
+      }
+      if (!selectedCompanyOfficeId) {
+        throw new Error(
+          translate(
+            "messages.error.companyRequiredForUpload",
+            "Select a company before uploading reports.",
+          ),
+        );
+      }
+
+      const activeToken = await resolveActiveApiToken();
 
       setSuccess(
         translate(
@@ -1250,6 +1238,12 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       }
 
       const insertedCount = data.created || 0;
+      if (insertedCount > 0) {
+        recordUploadBatch(selectedCompanyOfficeId, "quick", {
+          inserted: insertedCount,
+          nameHint: selectedCompany?.name,
+        });
+      }
       setSuccess(
         translate(
           "messages.success.filesUploadedSubmitting",
@@ -1457,18 +1451,28 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
           setError("");
           return [];
         }
+
+        if (!extractTaqeemUsernameFromUser(user || {}) || !selectedCompanyOfficeId) {
+          setReports([]);
+          setReportsPagination({
+            page: 1,
+            limit: itemsPerPage,
+            total: 0,
+            totalPages: 1,
+            hasNextPage: false,
+            hasPrevPage: false,
+          });
+          setError("");
+          return [];
+        }
+
         setReportsLoading(true);
 
-        // Build query parameters for backend pagination
         const params = new URLSearchParams({
           page: currentPage.toString(),
           limit: itemsPerPage.toString(),
+          companyOfficeId: selectedCompanyOfficeId,
         });
-        if (!isGuestUser && selectedCompanyOfficeId) {
-          params.append("companyOfficeId", selectedCompanyOfficeId);
-        }
-
-        // REMOVED: Status filter parameter - we'll filter on frontend instead
 
         const result = await window.electronAPI.apiRequest(
           "GET",
@@ -1489,7 +1493,11 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
           );
         }
 
-        const reportList = Array.isArray(result.reports) ? result.reports : [];
+        const reportList = Array.isArray(result.data)
+          ? result.data
+          : Array.isArray(result.reports)
+            ? result.reports
+            : [];
         const paginationInfo = result.pagination || {};
         const statusSyncQueue = [];
         const normalizedReportList = reportList.map((report) => {
@@ -1531,87 +1539,14 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     },
     [
       token,
+      user,
       currentPage,
       itemsPerPage,
       selectedCompanyOfficeId,
-      isGuestUser,
       setReports,
       setReportsPagination,
       setError,
     ],
-  );
-
-  const loadUnassignedReports = useCallback(
-    async (overrideToken) => {
-      try {
-        const activeToken = overrideToken || token;
-        if (!activeToken) {
-          setUnassignedReports([]);
-          return [];
-        }
-        if (isGuestUser) {
-          setUnassignedReports([]);
-          return [];
-        }
-        setUnassignedLoading(true);
-
-        const params = new URLSearchParams({
-          page: "1",
-          limit: String(Math.max(20, itemsPerPage || 20)),
-          unassigned: "true",
-        });
-
-        const result = await window.electronAPI.apiRequest(
-          "GET",
-          `/api/submit-reports-quickly/user?${params.toString()}`,
-          {},
-          {
-            Authorization: `Bearer ${activeToken}`,
-          },
-        );
-
-        if (!result?.success) {
-          throw new Error(
-            result?.message || "Failed to load unassigned reports.",
-          );
-        }
-
-        const reportList = Array.isArray(result.reports) ? result.reports : [];
-        const statusSyncQueue = [];
-        const normalizedReportList = reportList.map((report) => {
-          const recordId = getReportRecordId(report);
-          const expectedStatus = computeQuickReportStatus(report);
-          const currentStatus = String(report?.report_status || "")
-            .trim()
-            .toLowerCase();
-          if (recordId && currentStatus !== expectedStatus) {
-            statusSyncQueue.push({ recordId, report_status: expectedStatus });
-          }
-          return { ...report, report_status: expectedStatus };
-        });
-        setUnassignedReports(normalizedReportList);
-        if (statusSyncQueue.length > 0) {
-          Promise.allSettled(
-            statusSyncQueue.map((entry) =>
-              updateSubmitReportsQuickly(entry.recordId, {
-                report_status: entry.report_status,
-              }),
-            ),
-          ).catch(() => {});
-        }
-        return normalizedReportList;
-      } catch (err) {
-        console.warn(
-          "[SubmitReportsQuickly] Failed to load unassigned reports:",
-          err,
-        );
-        setUnassignedReports([]);
-        return [];
-      } finally {
-        setUnassignedLoading(false);
-      }
-    },
-    [token, itemsPerPage, isGuestUser],
   );
 
   const clearReportCreatedCache = useCallback((recordId) => {
@@ -1689,12 +1624,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
   useEffect(() => {
     loadReports();
   }, [currentPage, itemsPerPage, token, loadReports]);
-
-  useEffect(() => {
-    if (!isGuestUser) {
-      loadUnassignedReports();
-    }
-  }, [token, loadUnassignedReports, isGuestUser]);
 
   useEffect(() => {
     return () => {
@@ -2374,7 +2303,24 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
         );
       }
 
-      const activeToken = await ensureGuestSession();
+      if (!extractTaqeemUsernameFromUser(user || {})) {
+        throw new Error(
+          translate(
+            "messages.error.taqeemRequiredForUpload",
+            "Log in to Taqeem and link your account before uploading reports.",
+          ),
+        );
+      }
+      if (!selectedCompanyOfficeId) {
+        throw new Error(
+          translate(
+            "messages.error.companyRequiredForUpload",
+            "Select a company before uploading reports.",
+          ),
+        );
+      }
+
+      const activeToken = await resolveActiveApiToken();
 
       setSuccess(
         translate(
@@ -2416,6 +2362,12 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       }
 
       const insertedCount = data.created || 0;
+      if (insertedCount > 0) {
+        recordUploadBatch(selectedCompanyOfficeId, "quick", {
+          inserted: insertedCount,
+          nameHint: selectedCompany?.name,
+        });
+      }
       setSuccess(
         translate(
           "messages.success.filesUploaded",
@@ -2424,7 +2376,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
         ),
       );
       await loadReports(activeToken);
-      await loadUnassignedReports(activeToken);
       setExcelFiles([]);
       setPdfFiles([]);
       setPdfPathMap({}); // Reset path map
@@ -2920,9 +2871,9 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
 
       // Use global recommendedTabs if tabsNum not provided, otherwise use the provided value
       const resolvedTabs = tabsNum || Math.max(1, Number(recommendedTabs) || 3);
-      const report =
-        reports.find((item) => getReportRecordId(item) === recordId) ||
-        unassignedReports.find((item) => getReportRecordId(item) === recordId);
+      const report = reports.find(
+        (item) => getReportRecordId(item) === recordId,
+      );
       const assetCount = resolveReportAssetCount(report, assetCountOverride);
       let assignedOfficeId = report?.company_office_id
         ? String(report.company_office_id)
@@ -3021,11 +2972,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
               if (report) {
                 report.company_office_id = nextOfficeId;
               }
-              setUnassignedReports((prev) =>
-                prev.filter((item) => getReportRecordId(item) !== recordId),
-              );
               await loadReports();
-              await loadUnassignedReports();
             } catch (err) {
               console.warn("Failed to update report company office id", err);
             }
@@ -3119,7 +3066,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
             );
           }
           await loadReports();
-          await loadUnassignedReports();
           return {
             success: true,
             reportId: createdReportId || recordId,
@@ -3175,10 +3121,8 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       reports,
       selectedCompanyOfficeId,
       token,
-      unassignedReports,
       recommendedTabs,
       setTaqeemStatus,
-      setUnassignedReports,
       taqeemStatus?.state,
     ],
   );
@@ -3317,20 +3261,11 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     () => user?._id || user?.id || user?.userId || user?.user?._id || null,
     [user],
   );
-  const temporaryReports = useMemo(
-    () => reports.filter((report) => !hasTaqeemReportId(report)),
-    [reports],
-  );
-  const temporaryLoading = reportsLoading;
-  const showTemporarySection = isGuestUser;
 
   const getReportByRecordId = useCallback(
     (recordId) =>
-      reports.find((report) => getReportRecordId(report) === recordId) ||
-      unassignedReports.find(
-        (report) => getReportRecordId(report) === recordId,
-      ),
-    [reports, unassignedReports],
+      reports.find((report) => getReportRecordId(report) === recordId),
+    [reports],
   );
 
   const handleDeleteReport = async (reportOrId, options = {}) => {
@@ -3619,7 +3554,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
             }),
           );
           await loadReports();
-          await loadUnassignedReports();
         } catch (err) {
           console.warn(
             "Failed to update company office id for bulk reports",
@@ -3908,7 +3842,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
               report.company_office_id = assignedOfficeId;
             }
             await loadReports();
-            await loadUnassignedReports();
           } catch (err) {
             console.warn("Failed to update report company office id", err);
           }
@@ -4253,210 +4186,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
             <CheckCircle2 className="w-4 h-4 mt-0.5 flex-shrink-0" />
           )}
           <div className="text-xs font-medium">{error || success}</div>
-        </div>
-      )}
-
-      {showTemporarySection && (
-        <div className="rounded-lg border border-amber-200 bg-amber-50/50 shadow-sm p-3 mb-3">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-sm font-semibold text-amber-900">
-                {translate("temporarySection.title", "Temporary Reports")}
-              </h3>
-              <p className="text-[10px] text-amber-700">
-                {translate(
-                  "temporarySection.subtitle",
-                  "Guest reports saved temporarily until linked with Taqeem.",
-                )}
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setShowTemporaryModal(true)}
-              className="inline-flex items-center gap-1.5 rounded-md border border-amber-300 bg-white px-2 py-1 text-[10px] font-semibold text-amber-800 hover:bg-amber-50"
-            >
-              <Table className="w-3 h-3" />
-              {translate("temporarySection.open", "Show Temporary Reports")}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {showTemporaryModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-start justify-center bg-black/40 px-3 py-6 overflow-auto"
-          onClick={() => setShowTemporaryModal(false)}
-        >
-          <div
-            className="w-full max-w-5xl rounded-lg bg-white shadow-lg border border-amber-200"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between px-4 py-3 border-b border-amber-100">
-              <div>
-                <h3 className="text-base font-semibold text-amber-900">
-                  {translate("temporaryModal.title", "Temporary Reports")}
-                </h3>
-                <p className="text-[11px] text-amber-700">
-                  {translate(
-                    "temporaryModal.subtitle",
-                    "Guest reports saved temporarily until linked with Taqeem.",
-                  )}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowTemporaryModal(false)}
-                className="text-amber-700 hover:text-amber-900 text-sm font-semibold"
-              >
-                {translate("temporaryModal.close", "Close")}
-              </button>
-            </div>
-            <div className="px-4 py-3 flex items-center justify-between">
-              <div className="text-[11px] text-amber-700">
-                {translate(
-                  "temporaryModal.guestSession",
-                  "Guest temporary reports.",
-                )}
-              </div>
-              <button
-                type="button"
-                onClick={() => loadReports()}
-                disabled={temporaryLoading}
-                className="inline-flex items-center gap-1.5 rounded-md border border-amber-300 bg-white px-2 py-1 text-[10px] font-semibold text-amber-800 hover:bg-amber-50 disabled:opacity-60"
-              >
-                <RefreshCw
-                  className={`w-3 h-3 ${temporaryLoading ? "animate-spin" : ""}`}
-                />
-                {temporaryLoading
-                  ? translate("temporaryModal.refreshing", "Refreshing...")
-                  : translate("temporaryModal.refresh", "Refresh")}
-              </button>
-            </div>
-            <div className="px-4 pb-4">
-              {temporaryLoading ? (
-                <div className="text-[11px] text-amber-700">
-                  {translate(
-                    "temporaryModal.loading",
-                    "Loading temporary reports...",
-                  )}
-                </div>
-              ) : temporaryReports.length === 0 ? (
-                <div className="text-[11px] text-amber-700">
-                  {translate(
-                    "temporaryModal.empty",
-                    "No guest temporary reports found.",
-                  )}
-                </div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-xs text-slate-700">
-                    <thead className="bg-amber-100/70 text-amber-900">
-                      <tr>
-                        <th className="px-2 py-1.5 text-left">
-                          {translate(
-                            "temporaryModal.table.reportId",
-                            "Report ID",
-                          )}
-                        </th>
-                        <th className="px-2 py-1.5 text-left">
-                          {translate("temporaryModal.table.client", "Client")}
-                        </th>
-                        <th className="px-2 py-1.5 text-left">
-                          {translate("temporaryModal.table.assets", "Assets")}
-                        </th>
-                        <th className="px-2 py-1.5 text-left">
-                          {translate("temporaryModal.table.status", "Status")}
-                        </th>
-                        <th className="px-2 py-1.5 text-left">
-                          {translate("temporaryModal.table.action", "Action")}
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-amber-100">
-                      {temporaryReports.map((report) => {
-                        const recordId = getReportRecordId(report);
-                        const assetCount = Array.isArray(report?.asset_data)
-                          ? report.asset_data.length
-                          : 0;
-                        const statusKey = getReportStatus(report);
-                        const statusLabel = translate(
-                          `reports.filter.${statusKey}`,
-                          reportStatusLabels[statusKey] || statusKey || "New",
-                        );
-                        const statusClass =
-                          reportStatusClasses[statusKey] ||
-                          "border-slate-200 bg-slate-50 text-slate-700";
-                        return (
-                          <tr
-                            key={recordId || report._id}
-                            className="hover:bg-amber-50/60"
-                          >
-                            <td className="px-2 py-1.5 text-[11px] text-slate-800">
-                              {report.report_id ||
-                                translate(
-                                  "reports.notSubmitted",
-                                  "Not Submitted",
-                                )}
-                            </td>
-                            <td className="px-2 py-1.5 text-[11px] text-slate-700">
-                              {report.client_name ||
-                                report.title ||
-                                translate(
-                                  "temporaryModal.unknownClient",
-                                  "Unknown",
-                                )}
-                            </td>
-                            <td className="px-2 py-1.5 text-[11px] text-slate-700">
-                              {assetCount}
-                            </td>
-                            <td className="px-2 py-1.5 text-[11px]">
-                              <span
-                                className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold ${statusClass}`}
-                              >
-                                {statusLabel}
-                              </span>
-                            </td>
-                            <td className="px-2 py-1.5 text-[11px]">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const tabs = resolveTabsForAssets(assetCount);
-                                  submitToTaqeem(recordId, tabs);
-                                }}
-                                className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-2 py-1 text-[10px] font-semibold text-white hover:bg-amber-700"
-                              >
-                                {translate(
-                                  "temporaryModal.assignAndSubmit",
-                                  "Assign & Submit",
-                                )}
-                              </button>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-              {isGuestUser && (
-                <div className="mt-3 flex items-center justify-between rounded-md border border-amber-200 bg-amber-100/60 px-2 py-1 text-[10px] text-amber-900">
-                  <span>
-                    {translate(
-                      "temporaryModal.registerHint",
-                      "Register your account to keep these reports linked to your phone.",
-                    )}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => onViewChange?.("registration")}
-                    className="rounded-md bg-amber-700 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-amber-800"
-                  >
-                    {translate("temporaryModal.register", "Register")}
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
         </div>
       )}
 

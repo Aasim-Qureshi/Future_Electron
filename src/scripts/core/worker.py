@@ -141,11 +141,55 @@ async def _run_command_safe(cmd):
         )
 
 
+async def _run_close_command(cmd):
+    """Close Taqeem browser session immediately; never wait behind serialized automation."""
+    command_id = cmd.get("commandId")
+    action = "close"
+    print(f"[PY] Received action: {action} id={command_id}", file=sys.stderr, flush=True)
+    try:
+        await closeBrowser()
+        print(
+            json.dumps(
+                {
+                    "status": "SUCCESS",
+                    "message": "Browser closed successfully",
+                    "commandId": command_id,
+                }
+            ),
+            flush=True,
+        )
+    except Exception as e:
+        print(
+            json.dumps(
+                {
+                    "status": "FAILED",
+                    "error": str(e),
+                    "commandId": command_id,
+                }
+            ),
+            flush=True,
+        )
+    finally:
+        print(
+            f"[PY] Finished action: {action} id={command_id}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 async def _process_one_command(cmd):
     action = str(cmd.get("action") or "").lower()
     # Pause/resume/stop must not wait behind long-running fills; they only flip flags.
     if action.startswith(("pause-", "resume-", "stop-")):
         asyncio.create_task(_run_command_safe(cmd))
+        return
+    # App quit must close Chrome even while elrajhi-filler owns the automation lock.
+    if action == "close":
+        await _run_close_command(cmd)
+        return
+    # check-status must stay responsive while long jobs (e.g. certificate download) hold the lock.
+    if action == "check-status":
+        await _run_command_safe(cmd)
         return
     async with _command_serial_lock:
         await _run_command_safe(cmd)
@@ -322,14 +366,30 @@ async def handle_command(cmd):
         only_if_closed = bool(cmd.get("onlyIfClosed", True))
         navigate_if_open = bool(cmd.get("navigateIfOpen", False))
         force_new = bool(cmd.get("forceNew", False))
+        skip_status_check = bool(cmd.get("skipStatusCheck", False))
         opened_new = False
         navigated = False
 
         try:
-            browser_status = await check_browser_status()
+            status_timed_out = False
+            if skip_status_check:
+                browser_status = {
+                    "status": "FAILED",
+                    "browserOpen": False,
+                }
+            else:
+                try:
+                    browser_status = await asyncio.wait_for(check_browser_status(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    status_timed_out = True
+                    browser_status = {
+                        "status": "FAILED",
+                        "error": "Browser status check timed out before opening login page",
+                        "browserOpen": False,
+                    }
             browser_open = bool(browser_status.get("browserOpen"))
 
-            if only_if_closed and browser_open and not force_new:
+            if only_if_closed and browser_open and not force_new and not status_timed_out:
                 result = {
                     "status": "SUCCESS",
                     "message": "Browser already running; skipped opening login page",
@@ -339,15 +399,24 @@ async def handle_command(cmd):
                     "navigated": False,
                 }
             else:
-                opened_new = force_new or not browser_open
-                b = await get_browser(force_new=force_new, headless_override=False)
+                effective_force_new = force_new or status_timed_out
+                opened_new = effective_force_new or not browser_open
+                b = await get_browser(force_new=effective_force_new, headless_override=False)
                 page = b.main_tab
                 if page is None:
                     page = await b.get("about:blank")
 
-                if opened_new or navigate_if_open or force_new:
+                if opened_new or navigate_if_open or effective_force_new:
                     await page.get(login_url)
                     navigated = True
+                    try:
+                        from scripts.loginFlow.taqeem_login_assist import (
+                            ensure_taqeem_primary_login_assist,
+                        )
+
+                        await ensure_taqeem_primary_login_assist(page)
+                    except Exception:
+                        pass
 
                 result = {
                     "status": "SUCCESS",
@@ -356,6 +425,8 @@ async def handle_command(cmd):
                     "alreadyOpen": not opened_new,
                     "openedNewBrowser": opened_new,
                     "navigated": navigated,
+                    "statusTimedOut": status_timed_out,
+                    "skippedStatusCheck": skip_status_check,
                     "url": login_url,
                 }
         except Exception as e:
@@ -525,13 +596,6 @@ async def handle_command(cmd):
             finalize_submission=finalize_submission,
         )
         result["commandId"] = cmd.get("commandId")
-
-        if result.get("status") == "SUCCESS":
-            await check_elrajhi_batches(
-                browser,
-                batch_id=batch_id,
-                tabs_num=tabs_num,
-            )
 
         print(json.dumps(result), flush=True)
 
@@ -1111,16 +1175,6 @@ async def handle_command(cmd):
         result["commandId"] = cmd.get("commandId")
 
         print(json.dumps(result), flush=True)
-
-    elif action == "close":
-        await closeBrowser()
-        result = {
-            "status": "SUCCESS",
-            "message": "Browser closed successfully",
-            "commandId": cmd.get("commandId"),
-        }
-        print(json.dumps(result), flush=True)
-        return "close"  # Signal to exit
 
     elif action == "ping":
         result = {

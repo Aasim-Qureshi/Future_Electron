@@ -16,9 +16,8 @@ async def register_user(user_data):
         # common local dev addresses
         candidates.extend(
             [
-                "http://167.71.231.64:300http://localhost:3000",
+                "http://localhost:3000",
                 "http://127.0.0.1:3000",
-                "https://future-electron-backend.onrender.com",
             ]
         )
 

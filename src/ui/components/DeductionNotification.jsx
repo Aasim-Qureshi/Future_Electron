@@ -1,4 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
+import navigation from "../constants/navigation";
+
+const { DEFAULT_HOME_VIEW } = navigation;
 
 const defaultMessageBuilder = (detail = {}) => {
   const reportIds =
@@ -10,7 +13,7 @@ const defaultMessageBuilder = (detail = {}) => {
     detail.batchId ||
     detail.recordId ||
     "Report / batch";
-  const pageLabel = detail.pageName || detail.source || "Packages";
+  const pageLabel = detail.pageName || detail.source || "Reports";
   const assetSuffix = detail.assetCount ? ` (${detail.assetCount} assets)` : "";
   const points = Number.isFinite(detail.deducted) ? detail.deducted : 0;
   return `Deducted ${points} point${points === 1 ? "" : "s"} for ${reportLabel} on ${pageLabel}${assetSuffix}.`;
@@ -47,9 +50,9 @@ const DeductionNotification = ({
       if (!matches) return;
       setNotification({
         ...detail,
-        pageName: detail.pageName || defaultPageName || detail.source || "Packages",
+        pageName: detail.pageName || defaultPageName || detail.source || "Reports",
         pageSource:
-          detail.pageSource || defaultPageSource || detail.source || "packages",
+          detail.pageSource || defaultPageSource || detail.source || "submit-reports-quickly",
         message: detail.message || defaultMessageBuilder(detail),
       });
       setExpanded(false);
@@ -81,7 +84,7 @@ const DeductionNotification = ({
       }),
     );
     if (onViewChange) {
-      onViewChange("packages");
+      onViewChange(DEFAULT_HOME_VIEW);
     }
   };
 
@@ -92,7 +95,7 @@ const DeductionNotification = ({
       <div className="flex items-center justify-between text-[11px] text-slate-500">
         <span>{notification.pageName}</span>
         <span className="uppercase tracking-[0.25em] text-[9px] text-slate-400">
-          {notification.pageSource || "packages"}
+          {notification.pageSource || "submit-reports-quickly"}
         </span>
       </div>
 

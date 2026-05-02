@@ -95,6 +95,24 @@ const setElectronCookieForBaseUrl = async (baseUrl, cookieObj) => {
   }
 };
 
+/** Max-Age (seconds) for refresh cookie when mirroring body.refreshToken (align with backend default). */
+const REFRESH_TOKEN_MAX_AGE_SEC =
+  (() => {
+    const d = Number(process.env.REFRESH_COOKIE_DAYS);
+    const days = Number.isFinite(d) && d > 0 ? d : 365 * 100;
+    return days * 24 * 60 * 60;
+  })();
+
+async function buildCookieHeaderForUrl(fullUrl) {
+  try {
+    const cookies = await session.defaultSession.cookies.get({ url: fullUrl });
+    if (!Array.isArray(cookies) || cookies.length === 0) return "";
+    return cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+  } catch {
+    return "";
+  }
+}
+
 const packageHandlers = {
   async handleApiRequest(event, requestData) {
     if (!requestData || typeof requestData !== "object") {
@@ -114,10 +132,8 @@ const packageHandlers = {
     if (envUrl) candidates.push(envUrl.replace(/\/$/, ""));
 
     candidates.push(
-      "http://167.71.231.64:3000",
       "http://localhost:3000",
       "http://127.0.0.1:3000",
-      "https://future-electron-backend.onrender.com",
     );
 
     const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
@@ -134,7 +150,7 @@ const packageHandlers = {
       };
 
       console.log(`[API] Attempting ${config.method} ${config.url}`);
-      const response = await axios(config);
+      let response = await axios(config);
 
       // Handle Set-Cookie headers
       const setCookieHeader =
@@ -162,13 +178,72 @@ const packageHandlers = {
           httpOnly: true,
           secure: process.env.NODE_ENV === "production",
           path: "/",
-          maxAge: 7 * 24 * 60 * 60,
+          maxAge: REFRESH_TOKEN_MAX_AGE_SEC,
         });
       }
 
       if (response.status >= 200 && response.status < 300) {
         console.log(`[API] Success: ${config.method} ${config.url}`);
         return response.data;
+      }
+
+      const hadAuthHeader = Boolean(
+        config.headers?.Authorization || config.headers?.authorization,
+      );
+      if (
+        hadAuthHeader &&
+        [401, 403].includes(response.status) &&
+        response.data?.message
+      ) {
+        const cookieHeader = await buildCookieHeaderForUrl(fullUrl);
+        if (cookieHeader) {
+          const retryHeaders = { ...config.headers };
+          delete retryHeaders.Authorization;
+          delete retryHeaders.authorization;
+          retryHeaders.Cookie = cookieHeader;
+          const retryResponse = await axios({
+            ...config,
+            headers: retryHeaders,
+          });
+
+          const setCookieHeaderRetry =
+            retryResponse.headers?.["set-cookie"] ||
+            retryResponse.headers?.["Set-Cookie"];
+          if (setCookieHeaderRetry) {
+            const cookieStrings = Array.isArray(setCookieHeaderRetry)
+              ? setCookieHeaderRetry
+              : [setCookieHeaderRetry];
+            for (const cookieStr of cookieStrings) {
+              try {
+                const parsed = parseSetCookieString(cookieStr);
+                await setElectronCookieForBaseUrl(baseUrl, parsed);
+              } catch (err) {
+                console.warn(
+                  "[Cookies] Could not parse/set Set-Cookie header (retry):",
+                  cookieStr,
+                  err,
+                );
+              }
+            }
+          } else if (retryResponse.data?.refreshToken) {
+            await setElectronCookieForBaseUrl(baseUrl, {
+              name: "refreshToken",
+              value: retryResponse.data.refreshToken,
+              httpOnly: true,
+              secure: process.env.NODE_ENV === "production",
+              path: "/",
+              maxAge: REFRESH_TOKEN_MAX_AGE_SEC,
+            });
+          }
+
+          if (retryResponse.status >= 200 && retryResponse.status < 300) {
+            console.log(
+              `[API] Success (cookie fallback): ${config.method} ${config.url}`,
+            );
+            return retryResponse.data;
+          }
+          response = retryResponse;
+        }
       }
 
       let msg = response.data?.message || `HTTP ${response.status}`;

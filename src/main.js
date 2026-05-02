@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, session } = require("electron");
+const { app, BrowserWindow, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
@@ -8,12 +8,15 @@ const pythonAPI = require("./services/python/PythonAPI");
 
 let mainWindow;
 
+/** Quit path enters `before-quit` twice: first we prevent quit and teardown Python; second we allow quit. */
+let allowQuitAfterPythonBridgeTeardown = false;
+
 const DEV_SERVER_URL = process.env.ELECTRON_RENDERER_URL || "";
 const SHOULD_OPEN_DEVTOOLS =
   process.env.ELECTRON_DEVTOOLS === "1" || process.argv.includes("--devtools");
 const STARTUP_TIMEOUT_MS = 60000;
-const LOADING_DELAY_MS = 3000;
-const AUTH_COOKIE_NAMES = ["refreshToken", "accessToken", "token"];
+/** Short splash before loading the real renderer (was 3000ms; lower = faster startup). */
+const LOADING_DELAY_MS = 500;
 const LOADING_ICON_PATH = path.join(__dirname, "assets", "icon.png");
 const LOADING_ICON_DATA_URL = fs.existsSync(LOADING_ICON_PATH)
   ? `data:image/png;base64,${fs.readFileSync(LOADING_ICON_PATH, "base64")}`
@@ -148,57 +151,6 @@ function isDevelopment() {
   return process.env.NODE_ENV === "development" || !app.isPackaged;
 }
 
-function buildCookieRemovalUrl(cookie) {
-  const host = String(cookie?.domain || "").replace(/^\./, "");
-  if (!host) return null;
-  const scheme = cookie?.secure ? "https" : "http";
-  const rawPath = String(cookie?.path || "/");
-  const pathPart = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
-  return `${scheme}://${host}${pathPart}`;
-}
-
-async function clearAuthCookiesFromSession(targetSession) {
-  if (!targetSession?.cookies) return 0;
-
-  let removedCount = 0;
-  for (const cookieName of AUTH_COOKIE_NAMES) {
-    const cookies = await targetSession.cookies.get({ name: cookieName });
-    if (!Array.isArray(cookies) || cookies.length === 0) continue;
-
-    const removals = cookies.map(async (cookie) => {
-      const cookieUrl = buildCookieRemovalUrl(cookie);
-      if (!cookieUrl) return false;
-      await targetSession.cookies.remove(cookieUrl, cookie.name);
-      return true;
-    });
-
-    const results = await Promise.allSettled(removals);
-    results.forEach((result) => {
-      if (result.status === "fulfilled" && result.value === true) {
-        removedCount += 1;
-      }
-    });
-  }
-
-  return removedCount;
-}
-
-async function clearPersistedAuthState() {
-  try {
-    const removedCount = await clearAuthCookiesFromSession(
-      session.defaultSession,
-    );
-    if (removedCount > 0) {
-      console.log(`[MAIN] Cleared ${removedCount} persisted auth cookie(s).`);
-    }
-  } catch (error) {
-    console.warn(
-      "[MAIN] Failed to clear persisted auth state:",
-      error?.message || error,
-    );
-  }
-}
-
 function buildErrorPage(message) {
   return (
     "data:text/html," +
@@ -319,26 +271,26 @@ async function loadProdRenderer(window) {
   const unpackedIndex = path.join(process.resourcesPath, "dist", "index.html");
   const asarIndex = path.join(__dirname, "../dist/index.html");
 
-  console.log("[MAIN] NODE_ENV=production. Checking for index files:");
-  console.log("[MAIN] unpackedIndex =", unpackedIndex);
-  console.log("[MAIN] asarIndex =", asarIndex);
-  try {
-    console.log(
-      "[MAIN] resourcesPath listing:",
-      fs.readdirSync(process.resourcesPath),
-    );
-  } catch (e) {
-    console.warn("[MAIN] cannot read resourcesPath:", e && e.message);
+  if (process.env.VALTECH_DEBUG_MAIN === "1") {
+    console.log("[MAIN] NODE_ENV=production. Checking for index files:");
+    console.log("[MAIN] unpackedIndex =", unpackedIndex);
+    console.log("[MAIN] asarIndex =", asarIndex);
+    try {
+      console.log(
+        "[MAIN] resourcesPath listing:",
+        fs.readdirSync(process.resourcesPath),
+      );
+    } catch (e) {
+      console.warn("[MAIN] cannot read resourcesPath:", e && e.message);
+    }
   }
 
   if (fs.existsSync(unpackedIndex)) {
-    console.log("[MAIN] Loading unpacked index from resources/dist");
     await window.loadFile(unpackedIndex);
     return;
   }
 
   if (fs.existsSync(asarIndex)) {
-    console.log("[MAIN] Loading index from app.asar (fallback)");
     await window.loadFile(asarIndex);
     return;
   }
@@ -369,16 +321,6 @@ function createWindow() {
     backgroundColor: "#0b0f17",
     show: false,
   });
-
-  // Capture renderer runtime failures to avoid silent white-screen issues.
-  mainWindow.webContents.on(
-    "console-message",
-    (_event, level, message, line, sourceId) => {
-      console.log(
-        `[RENDERER:${level}] ${message} (${sourceId || "unknown"}:${line || 0})`,
-      );
-    },
-  );
 
   mainWindow.webContents.on(
     "did-fail-load",
@@ -450,29 +392,41 @@ function createWindow() {
 
 // Electron app event handlers
 app.whenReady().then(async () => {
-  // Always start with a clean auth state so reopening the app requires login.
-  await clearPersistedAuthState();
+  // Keep Electron session cookies (e.g. refreshToken) across restarts so users stay signed in.
+  // Logout from the renderer still clears cookies via IPC.
 
   // Register IPC handlers BEFORE creating window to avoid race conditions
   registerIpcHandlers();
   createWindow();
 });
 
-app.on("window-all-closed", async () => {
-  // Drop persisted auth state on app close.
-  await clearPersistedAuthState();
-
-  // Close Python worker gracefully when app is quitting
+async function teardownPythonBridge() {
   try {
     await pythonAPI.closeWorker();
   } catch (error) {
-    console.error("[MAIN] Error closing worker:", error);
+    console.error("[MAIN] Error closing Python worker / Taqeem browser:", error);
+  }
+}
+
+app.on("before-quit", (event) => {
+  if (allowQuitAfterPythonBridgeTeardown) {
+    allowQuitAfterPythonBridgeTeardown = false;
+    return;
   }
 
+  event.preventDefault();
+
+  teardownPythonBridge().finally(() => {
+    allowQuitAfterPythonBridgeTeardown = true;
+    app.quit();
+  });
+});
+
+app.on("window-all-closed", () => {
   // Unregister IPC handlers to prevent memory leaks
   unregisterIpcHandlers();
 
-  // On macOS, keep app running even when all windows are closed
+  // On macOS, keep app running even when all windows are closed (Taqeem Chrome stays until user quits).
   if (process.platform !== "darwin") {
     app.quit();
   }

@@ -479,7 +479,6 @@ const fetchSubmitReportsQuickly = async (
 ) => {
   const params = {};
   if (companyOfficeId) params.companyOfficeId = companyOfficeId;
-  if (options?.unassigned) params.unassigned = true;
   const response = await httpClient.get("/submit-reports-quickly", { params });
   return response.data;
 };

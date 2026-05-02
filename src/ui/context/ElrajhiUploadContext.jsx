@@ -44,7 +44,6 @@ export const ElrajhiUploadProvider = ({ children }) => {
     const [rememberedFiles, setRememberedFiles] = useState(defaultRememberedFiles);
     const [sendingTaqeem, setSendingTaqeem] = useState(false);
     const [sendingValidation, setSendingValidation] = useState(false);
-    const [pdfOnlySending, setPdfOnlySending] = useState(false);
     const [loadingValuers, setLoadingValuers] = useState(false);
 
     useEffect(() => {
@@ -109,7 +108,6 @@ export const ElrajhiUploadProvider = ({ children }) => {
         setValidationMessage(null);
         setValidationDownloadPath(null);
         setSendingValidation(false);
-        setPdfOnlySending(false);
         setLoadingValuers(false);
         setRememberedFiles((prev) => ({
             ...prev,
@@ -157,8 +155,6 @@ export const ElrajhiUploadProvider = ({ children }) => {
             setSendingTaqeem,
             sendingValidation,
             setSendingValidation,
-            pdfOnlySending,
-            setPdfOnlySending,
             loadingValuers,
             setLoadingValuers,
             resetMainFlow,
@@ -183,7 +179,6 @@ export const ElrajhiUploadProvider = ({ children }) => {
             rememberedFiles,
             sendingTaqeem,
             sendingValidation,
-            pdfOnlySending,
             loadingValuers,
         ]
     );

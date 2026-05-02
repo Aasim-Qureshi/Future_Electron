@@ -42,6 +42,13 @@ module.exports = {
         })
     ],
     resolve: {
-        extensions: ['.js', '.jsx']
-    }
+        extensions: ['.js', '.jsx'],
+        // Force CJS build: ESM re-exports break `require('i18next')` (namespace has no `.on`, only `default` does)
+        alias: {
+            i18next: path.resolve(__dirname, 'node_modules/i18next/dist/cjs/i18next.js'),
+        },
+    },
+    optimization: {
+        moduleIds: 'deterministic',
+    },
 };

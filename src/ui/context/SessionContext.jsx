@@ -1,8 +1,26 @@
-import React, { createContext, useContext, useState, useEffect } from "react";
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+} from "react";
+import { isAccessTokenValid } from "../utils/accessToken";
 
 const SessionContext = createContext();
 const USER_STORAGE_KEY = "user";
 const TOKEN_STORAGE_KEY = "token";
+/** رقم المستخدم المحلي الثابت في التطبيق (ليس "ضيفًا" من واجهة المستخدم) */
+export const LOCAL_APP_USER_PHONE = "000";
+const LOCAL_USER_PHONE = LOCAL_APP_USER_PHONE;
+/** بعد تسجيل الخروج: لا تُستعاد جلسة الضيف تلقائيًا حتى يمرّ المستخدم بفورم الدخول المحلي */
+const REQUIRE_LOCAL_APP_LOGIN_KEY = "vt:requireLocalAppLogin";
+
+const buildLocalSingleUser = () => ({
+  id: LOCAL_USER_PHONE,
+  phone: LOCAL_USER_PHONE,
+  guest: true,
+});
 
 const getSessionStorage = () => {
   if (typeof window === "undefined") return null;
@@ -32,6 +50,25 @@ const safeSet = (storage, key, value) => {
   }
 };
 
+/** Auth survives Electron restarts: primary store is localStorage; sessionStorage is legacy. */
+const persistAuthKeys = (localRef, sessionRef, userJson, tokenValue) => {
+  if (userJson != null) {
+    safeSet(localRef, USER_STORAGE_KEY, userJson);
+    safeRemove(sessionRef, USER_STORAGE_KEY);
+  }
+  if (tokenValue != null) {
+    safeSet(localRef, TOKEN_STORAGE_KEY, tokenValue);
+    safeRemove(sessionRef, TOKEN_STORAGE_KEY);
+  }
+};
+
+const clearAllAuthKeys = (localRef, sessionRef) => {
+  safeRemove(localRef, USER_STORAGE_KEY);
+  safeRemove(localRef, TOKEN_STORAGE_KEY);
+  safeRemove(sessionRef, USER_STORAGE_KEY);
+  safeRemove(sessionRef, TOKEN_STORAGE_KEY);
+};
+
 export const useSession = () => {
   const context = useContext(SessionContext);
   if (!context) {
@@ -45,17 +82,20 @@ export const SessionProvider = ({ children }) => {
   const [token, setToken] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isGuest, setIsGuest] = useState(false);
+  const [sessionHydrated, setSessionHydrated] = useState(false);
+  const [authBootstrapPending, setAuthBootstrapPending] = useState(false);
+  const [blockSilentGuest, setBlockSilentGuest] = useState(false);
 
   const clearPersistedRefreshToken = async () => {
     if (!window?.electronAPI?.clearRefreshToken) return;
 
+    const env =
+      typeof process !== "undefined" && process.env ? process.env : {};
     const candidateBaseUrls = [
-      process.env.BACKEND_URL,
-      process.env.REACT_APP_BACKEND_URL,
-      "http://167.71.231.64:3000",
+      env.BACKEND_URL,
+      env.REACT_APP_BACKEND_URL,
       "http://localhost:3000",
       "http://127.0.0.1:3000",
-      "https://future-electron-backend.onrender.com",
     ].filter(Boolean);
 
     const uniqueBaseUrls = Array.from(new Set(candidateBaseUrls));
@@ -69,44 +109,157 @@ export const SessionProvider = ({ children }) => {
     );
   };
 
-  // Initialize session from sessionStorage on mount.
-  // Also clear legacy auth keys left in localStorage from older app versions.
+  const bootstrapGuestSession = useCallback(async () => {
+    if (!window?.electronAPI?.apiRequest) return null;
+    const result = await window.electronAPI.apiRequest(
+      "POST",
+      "/api/users/guest",
+      {},
+      {},
+    );
+    const access = result?.token || result?.refreshToken;
+    const apiUser = result?.user;
+    const localRef = getLocalStorage();
+    const sessionRef = getSessionStorage();
+    if (access) {
+      safeRemove(localRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
+      safeRemove(sessionRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
+      setToken(access);
+      setBlockSilentGuest(false);
+      persistAuthKeys(localRef, sessionRef, null, access);
+    }
+    if (apiUser && typeof apiUser === "object") {
+      const merged = {
+        ...apiUser,
+        phone: LOCAL_USER_PHONE,
+        guest: true,
+      };
+      setUser(merged);
+      persistAuthKeys(localRef, sessionRef, JSON.stringify(merged), null);
+    }
+    return access || null;
+  }, []);
+
   useEffect(() => {
-    const sessionStorageRef = getSessionStorage();
-    const localStorageRef = getLocalStorage();
+    const sessionRef = getSessionStorage();
+    const localRef = getLocalStorage();
 
-    const savedUser = sessionStorageRef?.getItem(USER_STORAGE_KEY);
-    const savedToken = sessionStorageRef?.getItem(TOKEN_STORAGE_KEY);
+    const requireLocalAppLogin =
+      localRef?.getItem(REQUIRE_LOCAL_APP_LOGIN_KEY) === "1" ||
+      sessionRef?.getItem(REQUIRE_LOCAL_APP_LOGIN_KEY) === "1";
 
-    if (savedUser) {
+    if (requireLocalAppLogin) {
+      safeRemove(localRef, USER_STORAGE_KEY);
+      safeRemove(sessionRef, USER_STORAGE_KEY);
+      safeRemove(localRef, TOKEN_STORAGE_KEY);
+      safeRemove(sessionRef, TOKEN_STORAGE_KEY);
+      setUser(null);
+      setIsGuest(false);
+      setToken(null);
+      setBlockSilentGuest(true);
+      setIsLoading(false);
+      return;
+    }
+
+    const savedUserJson =
+      localRef?.getItem(USER_STORAGE_KEY) ||
+      sessionRef?.getItem(USER_STORAGE_KEY);
+    let savedToken =
+      localRef?.getItem(TOKEN_STORAGE_KEY) ||
+      sessionRef?.getItem(TOKEN_STORAGE_KEY);
+
+    let restoredUser = false;
+
+    if (savedUserJson) {
       try {
-        const parsed = JSON.parse(savedUser);
+        const parsed = JSON.parse(savedUserJson);
         if (typeof parsed === "string") {
-          setUser({ id: parsed, guest: true });
+          setUser({ ...buildLocalSingleUser(), id: parsed });
           setIsGuest(true);
         } else {
           setUser(parsed);
-          setIsGuest(Boolean(parsed?.guest));
+          const guestish =
+            Boolean(parsed?.guest) ||
+            !parsed?.phone ||
+            String(parsed.phone) === LOCAL_USER_PHONE;
+          setIsGuest(guestish);
         }
+        restoredUser = true;
+        persistAuthKeys(localRef, sessionRef, savedUserJson, null);
       } catch (e) {
         console.error("Failed to parse saved user:", e);
-        safeRemove(sessionStorageRef, USER_STORAGE_KEY);
+        safeRemove(localRef, USER_STORAGE_KEY);
+        safeRemove(sessionRef, USER_STORAGE_KEY);
       }
     }
 
-    if (savedToken && savedToken !== "undefined" && savedToken !== "null") {
-      setToken(savedToken);
+    if (!restoredUser) {
+      const local = buildLocalSingleUser();
+      setUser(local);
+      setIsGuest(true);
+      persistAuthKeys(localRef, sessionRef, JSON.stringify(local), null);
     }
 
-    safeRemove(localStorageRef, USER_STORAGE_KEY);
-    safeRemove(localStorageRef, TOKEN_STORAGE_KEY);
+    if (savedToken && savedToken !== "undefined" && savedToken !== "null") {
+      if (isAccessTokenValid(savedToken)) {
+        setToken(savedToken);
+        persistAuthKeys(localRef, sessionRef, null, savedToken);
+      } else {
+        setBlockSilentGuest(true);
+        safeRemove(localRef, TOKEN_STORAGE_KEY);
+        safeRemove(sessionRef, TOKEN_STORAGE_KEY);
+        setToken(null);
+      }
+    }
 
     setIsLoading(false);
   }, []);
 
+  useEffect(() => {
+    if (isLoading) return;
+
+    let cancelled = false;
+
+    (async () => {
+      if (blockSilentGuest && !token) {
+        setSessionHydrated(true);
+        setAuthBootstrapPending(false);
+        return;
+      }
+
+      if (token && isAccessTokenValid(token)) {
+        setSessionHydrated(true);
+        setAuthBootstrapPending(false);
+        return;
+      }
+
+      if (!window?.electronAPI?.apiRequest) {
+        setSessionHydrated(true);
+        setAuthBootstrapPending(false);
+        return;
+      }
+
+      setAuthBootstrapPending(true);
+      try {
+        await bootstrapGuestSession();
+      } catch (err) {
+        console.warn("[Session] guest bootstrap skipped:", err?.message || err);
+      } finally {
+        if (!cancelled) {
+          setAuthBootstrapPending(false);
+          setSessionHydrated(true);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoading, token, bootstrapGuestSession, blockSilentGuest]);
+
   const login = (userData, accessToken) => {
-    const sessionStorageRef = getSessionStorage();
-    const localStorageRef = getLocalStorage();
+    const localRef = getLocalStorage();
+    const sessionRef = getSessionStorage();
 
     let normalizedUser = userData;
     let guestFlag = false;
@@ -120,42 +273,52 @@ export const SessionProvider = ({ children }) => {
 
     setUser(normalizedUser);
     setIsGuest(guestFlag);
-    safeSet(sessionStorageRef, USER_STORAGE_KEY, JSON.stringify(normalizedUser));
-    safeRemove(localStorageRef, USER_STORAGE_KEY);
 
     if (accessToken) {
+      safeRemove(localRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
+      safeRemove(sessionRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
       setToken(accessToken);
-      safeSet(sessionStorageRef, TOKEN_STORAGE_KEY, accessToken);
-      safeRemove(localStorageRef, TOKEN_STORAGE_KEY);
+      setBlockSilentGuest(false);
+      persistAuthKeys(
+        localRef,
+        sessionRef,
+        JSON.stringify(normalizedUser),
+        accessToken,
+      );
     } else {
       setToken(null);
-      safeRemove(sessionStorageRef, TOKEN_STORAGE_KEY);
-      safeRemove(localStorageRef, TOKEN_STORAGE_KEY);
+      persistAuthKeys(
+        localRef,
+        sessionRef,
+        JSON.stringify(normalizedUser),
+        null,
+      );
+      safeRemove(localRef, TOKEN_STORAGE_KEY);
+      safeRemove(sessionRef, TOKEN_STORAGE_KEY);
     }
   };
 
   const logout = () => {
-    const sessionStorageRef = getSessionStorage();
-    const localStorageRef = getLocalStorage();
+    const localRef = getLocalStorage();
+    const sessionRef = getSessionStorage();
 
-    setUser(null);
     setToken(null);
+    setUser(null);
     setIsGuest(false);
-    safeRemove(sessionStorageRef, USER_STORAGE_KEY);
-    safeRemove(sessionStorageRef, TOKEN_STORAGE_KEY);
-    safeRemove(localStorageRef, USER_STORAGE_KEY);
-    safeRemove(localStorageRef, TOKEN_STORAGE_KEY);
+    setBlockSilentGuest(true);
+    clearAllAuthKeys(localRef, sessionRef);
+    safeSet(localRef, REQUIRE_LOCAL_APP_LOGIN_KEY, "1");
+    safeSet(sessionRef, REQUIRE_LOCAL_APP_LOGIN_KEY, "1");
     void clearPersistedRefreshToken();
   };
 
   const updateUser = (userData) => {
-    const sessionStorageRef = getSessionStorage();
-    const localStorageRef = getLocalStorage();
+    const localRef = getLocalStorage();
+    const sessionRef = getSessionStorage();
 
     setUser(userData);
     setIsGuest(Boolean(userData?.guest));
-    safeSet(sessionStorageRef, USER_STORAGE_KEY, JSON.stringify(userData));
-    safeRemove(localStorageRef, USER_STORAGE_KEY);
+    persistAuthKeys(localRef, sessionRef, JSON.stringify(userData), null);
   };
 
   return (
@@ -164,6 +327,9 @@ export const SessionProvider = ({ children }) => {
         user,
         token,
         isLoading,
+        sessionHydrated,
+        authBootstrapPending,
+        bootstrapGuestSession,
         login,
         logout,
         updateUser,

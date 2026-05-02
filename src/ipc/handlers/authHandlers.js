@@ -1,13 +1,60 @@
 const { session, BrowserWindow, shell } = require('electron');
 const pythonAPI = require('../../services/python/PythonAPI');
 
+const { TAQEEM_ELECTRON_PARTITION } = require('../../shared/constants/taqeemElectronPartition');
+const taqeemSecondaryCredentials = require('../../shared/constants/taqeemSecondaryCredentials');
 let secondaryLoginWindow = null;
-const SECONDARY_PARTITION = 'persist:taqeem-secondary';
+const SECONDARY_PARTITION = TAQEEM_ELECTRON_PARTITION;
+const TAQEEM_APP_HOME_URL = 'https://qima.taqeem.gov.sa/';
 let lastExternalLoginTs = 0;
 let externalLoginInFlight = false;
+let secondaryPartitionSessionWired = false;
+
+function wireSecondaryPartitionPersistence() {
+    if (secondaryPartitionSessionWired) return;
+    secondaryPartitionSessionWired = true;
+    try {
+        const sec = session.fromPartition(SECONDARY_PARTITION);
+        // persist: partition stores cookies + web storage on disk; keep cache for fewer revalidation round-trips
+        sec.setCacheSize?.(200 * 1024 * 1024);
+    } catch (err) {
+        console.warn('[MAIN] Taqeem secondary session prefs:', err?.message || err);
+    }
+}
 
 function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, timeoutMs, label) {
+    let timer = null;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                reject(new Error(`${label} timed out`));
+            }, timeoutMs);
+        })
+    ]).finally(() => {
+        if (timer) clearTimeout(timer);
+    });
+}
+
+function normalizeReportIds(reports = []) {
+    if (!Array.isArray(reports)) return [];
+
+    const seen = new Set();
+    const reportIds = [];
+    reports.forEach((item) => {
+        const raw = item && typeof item === 'object'
+            ? item.reportId || item.report_id || item.reportid
+            : item;
+        const reportId = raw === undefined || raw === null ? '' : String(raw).trim();
+        if (!reportId || seen.has(reportId)) return;
+        seen.add(reportId);
+        reportIds.push(reportId);
+    });
+    return reportIds;
 }
 
 async function confirmSingleReport(win, reportId) {
@@ -22,15 +69,23 @@ async function confirmSingleReport(win, reportId) {
         new Promise((resolve) => {
             const deadline = Date.now() + 60000; // 60s to allow manual login if needed
             const attempt = () => {
-                const checkbox = document.querySelector('input#agree, input[name="policy"]');
-                const confirmBtn = document.querySelector('input#confirm[type="submit"]');
+                const checkbox = document.querySelector(
+                    'input#agree, input[name="policy"], input[type="checkbox"][name*="agree"], input[type="checkbox"][id*="agree"]'
+                );
+                const confirmBtn = document.querySelector(
+                    'input#confirm, button#confirm, input[name="confirm"], button[name="confirm"], input[type="submit"][value*="اعتماد"], button[type="submit"]'
+                );
                 if (checkbox && confirmBtn) {
                     try {
                         checkbox.checked = true;
                         checkbox.dispatchEvent(new Event('change', { bubbles: true }));
                         confirmBtn.disabled = false;
                         confirmBtn.removeAttribute('disabled');
-                        confirmBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        if (typeof confirmBtn.click === 'function') {
+                            confirmBtn.click();
+                        } else {
+                            confirmBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        }
                         resolve({ ok: true });
                         return;
                     } catch (err) {
@@ -88,6 +143,143 @@ async function waitForSecondaryLogin(win, timeoutMs = 180000, intervalMs = 1500)
         await delay(intervalMs);
     }
     throw new Error('Timed out waiting for Taqeem login.');
+}
+
+async function waitForNavigationStable(webContents, { stableMs = 750, timeoutMs = 45000 } = {}) {
+    const start = Date.now();
+    let lastUrl = '';
+    while (Date.now() - start < timeoutMs) {
+        if (!webContents || webContents.isDestroyed()) {
+            throw new Error('Navigation target destroyed');
+        }
+        while (webContents.isLoading()) {
+            await delay(80);
+            if (Date.now() - start > timeoutMs) {
+                throw new Error('Navigation timed out');
+            }
+        }
+        await delay(stableMs);
+        const u = webContents.getURL() || '';
+        if (u === lastUrl) {
+            return u;
+        }
+        lastUrl = u;
+    }
+    return webContents.getURL() || '';
+}
+
+function shouldOfferTaqeemLoginAssist(url) {
+    const u = String(url || '').toLowerCase();
+    if (u.startsWith('https://qima.taqeem.gov.sa/')) return false;
+    return u.includes('sso.taqeem.gov.sa') || u.includes('openid-connect');
+}
+
+async function runTaqeemLoginAssist(webContents) {
+    const loginId = taqeemSecondaryCredentials.TAQEEM_SECONDARY_LOGIN_ID;
+    const password = taqeemSecondaryCredentials.TAQEEM_SECONDARY_PASSWORD;
+    const loginIdJson = JSON.stringify(loginId);
+    const passwordJson = JSON.stringify(password);
+
+    await webContents.executeJavaScript(`
+        (function () {
+            var LOGIN_ID = ${loginIdJson};
+            var PASSWORD = ${passwordJson};
+            function pickUser() {
+                return document.querySelector(
+                    '#username, input[name="username"], input[name="login"], input#username, input[type="text"][autocomplete="username"]'
+                );
+            }
+            function pickPass() {
+                return document.querySelector('#password, input[name="password"], input[type="password"]');
+            }
+            var userEl = pickUser();
+            var passEl = pickPass();
+            if (userEl) {
+                userEl.focus();
+                userEl.value = LOGIN_ID;
+                userEl.dispatchEvent(new Event('input', { bubbles: true }));
+                userEl.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            if (passEl) {
+                passEl.value = PASSWORD;
+                passEl.dispatchEvent(new Event('input', { bubbles: true }));
+                passEl.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            var HID = 'vt-taqeem-secondary-cred-panel';
+            var old = document.getElementById(HID);
+            if (old) old.remove();
+            var panel = document.createElement('div');
+            panel.id = HID;
+            panel.setAttribute('dir', 'rtl');
+            panel.style.cssText = [
+                'position:fixed', 'top:0', 'left:0', 'right:0', 'z-index:2147483647',
+                'font-family:system-ui,Segoe UI,Tahoma,sans-serif', 'font-size:13px',
+                'background:#1a2744', 'color:#e8eefc', 'padding:10px 14px', 'text-align:center',
+                'box-shadow:0 2px 8px rgba(0,0,0,0.35)', 'line-height:1.55'
+            ].join(';');
+            var title = document.createElement('strong');
+            title.textContent = 'تسجيل دخول اعتماد التقارير (النافذة الثانوية)';
+            var titleWrap = document.createElement('div');
+            titleWrap.appendChild(title);
+            var line = document.createElement('div');
+            line.style.marginTop = '6px';
+            line.textContent =
+                'الهوية / الإقامة / البريد: ' + LOGIN_ID + ' — كلمة المرور: ' + PASSWORD;
+            var hint = document.createElement('div');
+            hint.style.marginTop = '6px';
+            hint.style.fontSize = '12px';
+            hint.style.opacity = '0.92';
+            hint.textContent =
+                'تم تعبئة الحقول تلقائياً عند الحاجة؛ أكمل أي خطوة يدوية (مثل التحقق بخطوتين). بعد أول دخول ناجح تُحفظ الجلسة في هذا المتصفح حتى لو أُغلقت النافذة.';
+            panel.appendChild(titleWrap);
+            panel.appendChild(line);
+            panel.appendChild(hint);
+            if (document.body) {
+                document.body.appendChild(panel);
+            }
+            return true;
+        })();
+    `);
+}
+
+function attachSecondaryTaqeemAssist(webContents) {
+    if (!webContents || webContents.__vtTaqeemAssist) return;
+    webContents.__vtTaqeemAssist = true;
+    webContents.on('did-finish-load', async () => {
+        try {
+            if (!webContents || webContents.isDestroyed()) return;
+            const url = webContents.getURL() || '';
+            if (!shouldOfferTaqeemLoginAssist(url)) return;
+            await runTaqeemLoginAssist(webContents);
+        } catch (err) {
+            console.warn('[MAIN] Taqeem login assist:', err?.message || err);
+        }
+    });
+}
+
+/**
+ * Prefer an existing Taqeem web session (persist partition) by opening the app root first.
+ * Only hits the explicit OAuth authorize URL if we never land on the IdP or app.
+ */
+async function loadSecondaryTaqeemSessionStart(win, loginUrl) {
+    if (!win || win.isDestroyed()) return;
+    wireSecondaryPartitionPersistence();
+    attachSecondaryTaqeemAssist(win.webContents);
+
+    await win.loadURL(TAQEEM_APP_HOME_URL);
+    let url = await waitForNavigationStable(win.webContents);
+    let lower = url.toLowerCase();
+    if (lower.startsWith('https://qima.taqeem.gov.sa/')) {
+        return;
+    }
+    if (!lower.includes('sso.taqeem.gov.sa') && !lower.includes('openid-connect')) {
+        await win.loadURL(loginUrl);
+        url = await waitForNavigationStable(win.webContents);
+        lower = url.toLowerCase();
+    }
+    if (shouldOfferTaqeemLoginAssist(url)) {
+        await runTaqeemLoginAssist(win.webContents);
+    }
 }
 
 const authHandlers = {
@@ -272,8 +464,8 @@ const authHandlers = {
             token,
             name = 'refreshToken',
             path = '/',
-            maxAgeDays = 7,
-            sessionOnly = true,
+            maxAgeDays = 365 * 100,
+            sessionOnly = false,
             sameSite = 'lax',
             secure = (process.env.NODE_ENV === 'production'),
             httpOnly = true
@@ -355,29 +547,20 @@ const authHandlers = {
         const openIfClosed = opts.onlyIfClosed !== false;
         const navigateIfOpen = !!opts.navigateIfOpen;
         const forceNewAutomation = !!opts.forceNewAutomation;
+        const skipStatusCheck = !!opts.skipStatusCheck;
         const waitForLogin = opts.waitForLogin === true;
         const loginTimeoutMs = Number(opts.loginTimeoutMs) || 180000;
-
-        let reportIds = [];
-        if (batchId) {
-            try {
-                const batchResult = await pythonAPI.auth.getReportsByBatch(batchId);
-                if (batchResult?.status === 'SUCCESS' && Array.isArray(batchResult.reports)) {
-                    reportIds = batchResult.reports.filter(Boolean);
-                } else {
-                    return { status: 'ERROR', error: batchResult?.error || `No reports found for batch ${batchId}` };
-                }
-            } catch (err) {
-                return { status: 'ERROR', error: err.message || String(err) };
-            }
-        }
+        const skipBatchLookup = opts.skipBatchLookup === true;
+        const closeAfterAction = opts.closeAfterAction === true;
+        let reportIds = normalizeReportIds(opts.reportIds || opts.reports || []);
 
         try {
             if (automationOnly) {
                 const automationResult = await pythonAPI.auth.openLoginPage(loginUrl, {
                     onlyIfClosed: openIfClosed,
                     navigateIfOpen,
-                    forceNew: forceNewAutomation
+                    forceNew: forceNewAutomation,
+                    skipStatusCheck
                 });
 
                 if (automationResult?.status === 'SUCCESS') {
@@ -413,6 +596,7 @@ const authHandlers = {
 
                 const now = Date.now();
                 if (now - lastExternalLoginTs < 4000) {
+                    externalLoginInFlight = false;
                     return {
                         status: 'SUCCESS',
                         message: 'Taqeem login already opened in external browser'
@@ -420,22 +604,28 @@ const authHandlers = {
                 }
                 lastExternalLoginTs = now;
 
-                await shell.openExternal(loginUrl);
+                try {
+                    await shell.openExternal(loginUrl);
 
-                setTimeout(() => {
+                    setTimeout(() => {
+                        externalLoginInFlight = false;
+                    }, 4000);
+
+                    return {
+                        status: 'SUCCESS',
+                        message: 'Opened Taqeem login in external browser'
+                    };
+                } catch (err) {
                     externalLoginInFlight = false;
-                }, 4000);
-
-                return {
-                    status: 'SUCCESS',
-                    message: 'Opened Taqeem login in external browser'
-                };
+                    throw err;
+                }
             }
             if (secondaryLoginWindow && !secondaryLoginWindow.isDestroyed()) {
                 secondaryLoginWindow.show();
                 secondaryLoginWindow.focus();
-                await secondaryLoginWindow.loadURL(loginUrl);
+                await loadSecondaryTaqeemSessionStart(secondaryLoginWindow, loginUrl);
             } else {
+                wireSecondaryPartitionPersistence();
                 secondaryLoginWindow = new BrowserWindow({
                     width: 1200,
                     height: 800,
@@ -451,7 +641,31 @@ const authHandlers = {
                     secondaryLoginWindow = null;
                 });
 
-                await secondaryLoginWindow.loadURL(loginUrl);
+                await loadSecondaryTaqeemSessionStart(secondaryLoginWindow, loginUrl);
+            }
+
+            if (!reportIds.length && batchId && skipBatchLookup) {
+                return {
+                    status: 'ERROR',
+                    error: `No submitted report IDs were provided for batch ${batchId}`
+                };
+            }
+
+            if (!reportIds.length && batchId) {
+                try {
+                    const batchResult = await withTimeout(
+                        pythonAPI.auth.getReportsByBatch(batchId),
+                        20000,
+                        `Loading submitted reports for batch ${batchId}`
+                    );
+                    if (batchResult?.status === 'SUCCESS' && Array.isArray(batchResult.reports)) {
+                        reportIds = normalizeReportIds(batchResult.reports);
+                    } else {
+                        return { status: 'ERROR', error: batchResult?.error || `No reports found for batch ${batchId}` };
+                    }
+                } catch (err) {
+                    return { status: 'ERROR', error: err.message || String(err) };
+                }
             }
 
             let batchSummary = null;
@@ -462,9 +676,16 @@ const authHandlers = {
                 batchSummary = await confirmReportsBatch(secondaryLoginWindow, reportIds);
             }
 
+            if (closeAfterAction && secondaryLoginWindow && !secondaryLoginWindow.isDestroyed()) {
+                secondaryLoginWindow.close();
+                secondaryLoginWindow = null;
+            }
+
             return {
                 status: 'SUCCESS',
-                message: 'Opened Taqeem login in a separate browser window',
+                message: closeAfterAction
+                    ? 'Processed Taqeem action in a separate browser window and closed it'
+                    : 'Opened Taqeem login in a separate browser window',
                 batch: batchSummary
             };
         } catch (error) {

@@ -434,7 +434,7 @@ class PythonWorkerService {
         if (!this.worker) return;
 
         try {
-            await this.sendCommand({ action: 'close' });
+            await this.sendCommand({ action: 'close' }, { allowFailure: true });
         } catch (error) {
             console.log('[PY] Close command failed, forcing shutdown:', error.message);
         } finally {

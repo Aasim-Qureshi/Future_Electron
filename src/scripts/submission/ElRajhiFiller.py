@@ -1,11 +1,9 @@
 import asyncio
-import os
 import sys
 import traceback
 from datetime import datetime
 from urllib.parse import urlparse
 
-from scripts.core.browser import spawn_new_browser
 from scripts.core.company_context import (
     build_report_create_url,
     get_selected_company,
@@ -29,6 +27,7 @@ from .macroFiller import fill_macro_form
 
 # Global pause state management
 pause_states = {}
+DEFAULT_ELRAJHI_ASSET_VALUE_BASE_ID = "6"
 
 
 def get_pause_state(batch_id):
@@ -120,12 +119,17 @@ def extract_asset_from_report(report_record):
         formatted_date = ""
 
     return {
-        "asset_type": "مركبه",
+        "asset_type": "مركبة",
         "production_capacity": "0",
         "production_capacity_measuring_unit": "0",
         "product_type": "0",
         "asset_name": report_record.get("asset_name"),
         "asset_usage_id": report_record.get("asset_usage"),
+        "value_base": str(
+            report_record.get("value_base")
+            or report_record.get("value_base_id")
+            or DEFAULT_ELRAJHI_ASSET_VALUE_BASE_ID
+        ),
         "inspection_date": formatted_date,  # Use the formatted date
         "final_value": report_record.get("final_value"),
         "market_approach": "1",
@@ -336,42 +340,213 @@ async def navigate_page_resilient(
     }
 
 
-async def open_workflow_page(browser, force_spawn=False):
-    new_browser = None
-    workflow_browser = None
-    page = None
+async def open_workflow_page(
+    browser,
+    *,
+    force_spawn=False,
+    headless=False,
+    spawn_timeout=25.0,
+    surface_timeout=30.0,
+):
+    """
+    Open a dedicated surface for ElRajhi steps.
 
-    if not force_spawn and browser:
+    Prefer a new window/tab in the already-authenticated Taqeem browser. Starting
+    a second nodriver Chrome process can hang on Windows before uc.start returns,
+    which blocks the Python worker and leaves the UI loading forever.
+    """
+    if browser is None:
+        return None, None, None
+
+    if force_spawn:
+        page = None
+        last_err = None
         try:
-            page = await browser.get("about:blank", new_tab=True)
-            if page is not None:
-                workflow_browser = browser
-                print(
-                    "[PY] ElRajhiFiller: using a dedicated automation tab in the existing Taqeem browser session.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        except Exception as existing_err:
+            page = await asyncio.wait_for(
+                browser.get("about:blank", new_window=True),
+                timeout=surface_timeout,
+            )
+        except Exception as err:
+            last_err = err
             print(
-                f"[PY] ElRajhiFiller: failed to open automation tab in existing browser: {existing_err}",
+                f"[PY] ElRajhiFiller: new_window failed ({err}); trying new_tab.",
                 file=sys.stderr,
                 flush=True,
             )
-            page = None
+            try:
+                page = await asyncio.wait_for(
+                    browser.get("about:blank", new_tab=True),
+                    timeout=surface_timeout,
+                )
+            except Exception as err2:
+                last_err = err2
 
-    if workflow_browser is None:
-        new_browser = await spawn_new_browser(browser, headless=False)
-        workflow_browser = new_browser
-        page = getattr(new_browser, "main_tab", None)
-        if page is None:
-            page = await new_browser.get("about:blank")
+        if page is not None:
+            print(
+                "[PY] ElRajhiFiller: using dedicated window/tab in existing "
+                "Taqeem browser session.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return browser, page, None
+
         print(
-            "[PY] ElRajhiFiller: using spawned browser (fallback).",
+            f"[PY] ElRajhiFiller: could not open Taqeem action window/tab: {last_err}",
             file=sys.stderr,
             flush=True,
         )
+        return None, None, None
 
-    return workflow_browser, page, new_browser
+    page = None
+    last_err = None
+    try:
+        page = await asyncio.wait_for(
+            browser.get("about:blank", new_window=True),
+            timeout=surface_timeout,
+        )
+    except Exception as err:
+        last_err = err
+        print(
+            f"[PY] ElRajhiFiller: new_window failed ({err}); trying new_tab.",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            page = await asyncio.wait_for(
+                browser.get("about:blank", new_tab=True),
+                timeout=surface_timeout,
+            )
+        except Exception as err2:
+            last_err = err2
+
+    if page is None:
+        print(
+            f"[PY] ElRajhiFiller: could not open automation tab/window: {last_err}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None, None, None
+
+    print(
+        "[PY] ElRajhiFiller: using new tab/window on existing Chrome (shared Taqeem session).",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    # new_browser stays None → finally block must not stop the login browser instance
+    return browser, page, None
+
+
+async def open_workflow_pages(workflow_browser, first_page, total_pages, timeout=30.0):
+    pages = [first_page]
+    for _ in range(max(0, int(total_pages or 1) - 1)):
+        try:
+            page = await asyncio.wait_for(
+                workflow_browser.get("about:blank", new_tab=True),
+                timeout=timeout,
+            )
+            pages.append(page)
+        except Exception as err:
+            print(
+                f"[PY] ElRajhiFiller: failed to open extra action tab: {err}",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
+    return pages
+
+
+def is_macro_fill_failed(result):
+    return isinstance(result, dict) and str(result.get("status", "")).upper() == "FAILED"
+
+
+async def update_elrajhi_record_status(
+    record_id,
+    *,
+    report_id=None,
+    submit_state=1,
+    report_status="COMPLETE",
+):
+    if not record_id:
+        return False
+
+    payload = {
+        "submit_state": submit_state,
+        "report_status": report_status,
+    }
+    if report_id:
+        payload["report_id"] = str(report_id)
+
+    try:
+        await http_patch(
+            f"/new-scripts/update-elrajhi-status/{record_id}",
+            json=payload,
+        )
+        return True
+    except Exception as e:
+        log(f"Failed to update ElRajhi status for {record_id}: {e}", "WARN")
+        return False
+
+
+async def update_elrajhi_record_status_by_report_id(
+    report_id,
+    *,
+    submit_state=1,
+    report_status="SENT",
+):
+    if not report_id:
+        return False
+
+    try:
+        report_data = await http_get(f"/new-scripts/report-id/{report_id}")
+        report = report_data.get("report")
+        record_id = report.get("_id") if report else None
+        if not record_id:
+            return False
+        return await update_elrajhi_record_status(
+            record_id,
+            report_id=report_id,
+            submit_state=submit_state,
+            report_status=report_status,
+        )
+    except Exception as e:
+        log(f"Failed to update ElRajhi status by report_id {report_id}: {e}", "WARN")
+        return False
+
+
+async def complete_macro_report(page, macro_info, finalize_submission):
+    """Mark the asset filled, then optionally send the report to the confirmer."""
+    report_id = macro_info.get("report_id")
+    record_id = macro_info.get("record_id")
+
+    status_updated = await update_elrajhi_record_status(
+        record_id,
+        report_id=report_id,
+        submit_state=1,
+        report_status="COMPLETE",
+    )
+
+    finalization_result = None
+    finalization_succeeded = False
+    if finalize_submission:
+        if report_id:
+            finalization_result = await finalize_report_submission(page, report_id)
+            finalization_succeeded = finalization_result.get("status") == "SUCCESS"
+            if finalization_succeeded:
+                await update_elrajhi_record_status(
+                    record_id,
+                    report_id=report_id,
+                    submit_state=1,
+                    report_status="SENT",
+                )
+        else:
+            finalization_result = {"status": "FAILED", "error": "Missing report_id"}
+
+    return {
+        "status_updated": status_updated,
+        "finalization": finalization_result,
+        "finalization_succeeded": finalization_succeeded,
+    }
 
 
 async def finalize_report_submission(page, report_id):
@@ -439,15 +614,27 @@ async def finalize_report_submission(page, report_id):
 
 async def finalize_multiple_reports(browser, report_ids):
     new_browser = None
+    action_page = None
     try:
-        new_browser = await spawn_new_browser(browser, headless=False)
-        page = new_browser.main_tab
+        workflow_browser, page, new_browser = await open_workflow_page(
+            browser,
+            force_spawn=True,
+            headless=False,
+        )
+        if workflow_browser is None or page is None:
+            return {"status": "FAILED", "error": "Could not open Taqeem action browser."}
+        action_page = page
         finalized_reports = 0
         failed_reports = 0
         for report_id in report_ids:
             result = await finalize_report_submission(page, report_id)
             if result.get("status") == "SUCCESS":
                 finalized_reports += 1
+                await update_elrajhi_record_status_by_report_id(
+                    report_id,
+                    submit_state=1,
+                    report_status="SENT",
+                )
             else:
                 failed_reports += 1
 
@@ -462,6 +649,11 @@ async def finalize_multiple_reports(browser, report_ids):
     finally:
         if new_browser:
             new_browser.stop()
+        elif action_page is not None:
+            try:
+                await action_page.close()
+            except Exception:
+                pass
 
 
 async def ElRajhiFiller(
@@ -473,6 +665,7 @@ async def ElRajhiFiller(
     finalize_submission=True,
 ):
     new_browser = None
+    automation_surface_page = None
     try:
         # Create process for this batch
         process_id = f"elrajhi-filler-{batch_id}"
@@ -542,20 +735,14 @@ async def ElRajhiFiller(
 
         await http_patch(f"/new-scripts/set-start-time-by-batch-id/{batch_id}")
 
-        # Use the SAME worker browser session as manual Taqeem login (visible tab).
-        # spawn_new_browser() starts a separate Chrome profile; cookies/session often
-        # do not carry over → user stays on home in the "main" window while nothing works.
-        new_browser = None
+        # ElRajhi runs in a dedicated window/tab on the authenticated Taqeem
+        # browser. This avoids the Windows uc.start hang seen in check status.
         workflow_browser = None
         main_page = None
-        force_spawn = os.environ.get("ELRAJHI_FORCE_SPAWN_BROWSER", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
         workflow_browser, main_page, new_browser = await open_workflow_page(
             browser,
-            force_spawn=force_spawn,
+            force_spawn=True,
+            headless=False,
         )
 
         if main_page is None:
@@ -563,6 +750,7 @@ async def ElRajhiFiller(
                 "status": "FAILED",
                 "error": "No browser tab available for El Rajhi automation.",
             }
+        automation_surface_page = main_page
 
         # Land on the selected office first (visible window + correct session scope)
         try:
@@ -605,6 +793,8 @@ async def ElRajhiFiller(
         failed_reports = 0
         finalized_reports = 0
         finalization_failed = 0
+        completed_macros = 0
+        failed_macros = 0
 
         # Send initial progress using process controller
         emit_progress(process_id, message="Starting report creation phase...")
@@ -703,13 +893,10 @@ async def ElRajhiFiller(
 
             # Create additional tabs for parallel macro filling
             tabs_num = max(1, min(int(tabs_num or 1), len(macros_to_fill)))
-            pages = [main_page] + [
-                await workflow_browser.get("about:blank", new_tab=True)
-                for _ in range(tabs_num - 1)
-            ]
+            pages = await open_workflow_pages(workflow_browser, main_page, tabs_num)
 
             # Split macros into balanced chunks
-            macro_chunks = balanced_chunks(macros_to_fill, tabs_num)
+            macro_chunks = balanced_chunks(macros_to_fill, len(pages))
 
             completed_macros = 0
             failed_macros = 0
@@ -763,30 +950,23 @@ async def ElRajhiFiller(
                             field_types=macro_form_config["field_types"],
                         )
 
-                        # Immediately finalize this report in the same tab after filling its macro
-                        finalization_result = None
-                        if finalize_submission:
-                            report_id_for_macro = macro_info.get("report_id")
-                            if report_id_for_macro:
-                                finalization_result = await finalize_report_submission(
-                                    page, report_id_for_macro
-                                )
-                                if finalization_result.get("status") == "SUCCESS":
+                        macro_failed = is_macro_fill_failed(macro_result)
+                        if not macro_failed:
+                            completion_result = await complete_macro_report(
+                                page,
+                                macro_info,
+                                finalize_submission,
+                            )
+                            if finalize_submission:
+                                if completion_result.get("finalization_succeeded"):
                                     finalized_reports += 1
                                 else:
                                     finalization_failed += 1
-                            else:
-                                finalization_failed += 1
-                                finalization_result = {
-                                    "status": "FAILED",
-                                    "error": "Missing report_id",
-                                }
+                        elif finalize_submission:
+                            finalization_failed += 1
 
                         async with completed_lock:
-                            if (
-                                isinstance(macro_result, dict)
-                                and macro_result.get("status") == "FAILED"
-                            ):
+                            if macro_failed:
                                 failed_macros += 1
                             completed_macros += 1
                             current_completed = completed_macros
@@ -872,6 +1052,16 @@ async def ElRajhiFiller(
         return {"status": "FAILED", "error": str(e), "traceback": tb}
 
     finally:
+        if automation_surface_page is not None:
+            try:
+                await automation_surface_page.close()
+                print(
+                    "[PY] ElRajhiFiller: closed automation window/tab.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
         if new_browser:
             new_browser.stop()
 
@@ -885,6 +1075,7 @@ async def ElrajhiRetry(
     finalize_submission=False,
 ):
     new_browser = None
+    automation_surface_page = None
     try:
         # Create process for retry
         process_id = f"elrajhi-retry-{batch_id}"
@@ -976,9 +1167,15 @@ async def ElrajhiRetry(
             non_created_count=total_non_created,
         )
 
-        # Use single tab for report operations
-        new_browser = await spawn_new_browser(browser, headless=False)
-        main_page = new_browser.tabs[0]
+        # Use the same action surface strategy as Send all reports.
+        workflow_browser, main_page, new_browser = await open_workflow_page(
+            browser,
+            force_spawn=True,
+            headless=False,
+        )
+        if workflow_browser is None or main_page is None:
+            return {"status": "FAILED", "error": "Could not open Taqeem action browser."}
+        automation_surface_page = main_page
 
         # Counters
         completed_incomplete = 0
@@ -1057,7 +1254,10 @@ async def ElrajhiRetry(
                     asset_create_url = (
                         f"https://qima.taqeem.gov.sa/report/asset/create/{report_id}"
                     )
-                    main_page = await new_browser.get(asset_create_url)
+                    main_page = await asyncio.wait_for(
+                        workflow_browser.get(asset_create_url),
+                        timeout=40.0,
+                    )
                     await asyncio.sleep(1)
                     log(
                         f"No macro found for report {report_id}, creating one...",
@@ -1288,12 +1488,9 @@ async def ElrajhiRetry(
             process_state.metadata["phase"] = "macro_filling"
 
             tabs_num = max(1, min(int(tabs_num or 1), len(macros_to_fill)))
-            pages = [main_page] + [
-                await new_browser.get("about:blank", new_tab=True)
-                for _ in range(tabs_num - 1)
-            ]
+            pages = await open_workflow_pages(workflow_browser, main_page, tabs_num)
 
-            macro_chunks = balanced_chunks(macros_to_fill, tabs_num)
+            macro_chunks = balanced_chunks(macros_to_fill, len(pages))
 
             completed_macros = 0
             failed_macros = 0
@@ -1343,30 +1540,23 @@ async def ElrajhiRetry(
                             field_types=macro_form_config["field_types"],
                         )
 
-                        # Finalize submission if requested
-                        finalization_result = None
-                        if finalize_submission:
-                            report_id_for_macro = macro_info.get("report_id")
-                            if report_id_for_macro:
-                                finalization_result = await finalize_report_submission(
-                                    page, report_id_for_macro
-                                )
-                                if finalization_result.get("status") == "SUCCESS":
+                        macro_failed = is_macro_fill_failed(macro_result)
+                        if not macro_failed:
+                            completion_result = await complete_macro_report(
+                                page,
+                                macro_info,
+                                finalize_submission,
+                            )
+                            if finalize_submission:
+                                if completion_result.get("finalization_succeeded"):
                                     finalized_reports += 1
                                 else:
                                     finalization_failed += 1
-                            else:
-                                finalization_failed += 1
-                                finalization_result = {
-                                    "status": "FAILED",
-                                    "error": "Missing report_id",
-                                }
+                        elif finalize_submission:
+                            finalization_failed += 1
 
                         async with completed_lock:
-                            if (
-                                isinstance(macro_result, dict)
-                                and macro_result.get("status") == "FAILED"
-                            ):
+                            if macro_failed:
                                 failed_macros += 1
                             completed_macros += 1
                             current_completed = completed_macros
@@ -1466,6 +1656,11 @@ async def ElrajhiRetry(
         return {"status": "FAILED", "error": str(e), "traceback": tb}
 
     finally:
+        if automation_surface_page is not None and not new_browser:
+            try:
+                await automation_surface_page.close()
+            except Exception:
+                pass
         if new_browser:
             new_browser.stop()
 
@@ -1479,6 +1674,7 @@ async def ElrajhiRetryByReportIds(
     finalize_submission=False,
 ):
     new_browser = None
+    automation_surface_page = None
     try:
         if not report_ids:
             return {"status": "FAILED", "error": "report_ids array is empty"}
@@ -1558,8 +1754,14 @@ async def ElrajhiRetryByReportIds(
             finalize_submission=finalize_submission,
         )
 
-        new_browser = await spawn_new_browser(browser, headless=False)
-        main_page = new_browser.main_tab
+        workflow_browser, main_page, new_browser = await open_workflow_page(
+            browser,
+            force_spawn=True,
+            headless=False,
+        )
+        if workflow_browser is None or main_page is None:
+            return {"status": "FAILED", "error": "Could not open Taqeem action browser."}
+        automation_surface_page = main_page
 
         macros_to_fill = []
         results = []
@@ -1643,10 +1845,11 @@ async def ElrajhiRetryByReportIds(
         # ---- PHASE 3: MACRO FILLING ----
         if macros_to_fill:
             process_state.total += len(macros_to_fill)
-            pages = [main_page] + [
-                await new_browser.get("about:blank", new_tab=True)
-                for _ in range(min(tabs_num, len(macros_to_fill)) - 1)
-            ]
+            pages = await open_workflow_pages(
+                workflow_browser,
+                main_page,
+                min(tabs_num, len(macros_to_fill)),
+            )
 
             chunks = balanced_chunks(macros_to_fill, len(pages))
             lock = asyncio.Lock()
@@ -1669,16 +1872,24 @@ async def ElrajhiRetryByReportIds(
                             macro_form_config["field_types"],
                         )
 
-                        if finalize_submission:
-                            fin = await finalize_report_submission(page, m["report_id"])
-                            if fin["status"] == "SUCCESS":
-                                finalized_reports += 1
-                            else:
-                                finalization_failed += 1
+                        macro_failed = is_macro_fill_failed(res)
+                        if not macro_failed:
+                            completion_result = await complete_macro_report(
+                                page,
+                                m,
+                                finalize_submission,
+                            )
+                            if finalize_submission:
+                                if completion_result.get("finalization_succeeded"):
+                                    finalized_reports += 1
+                                else:
+                                    finalization_failed += 1
+                        elif finalize_submission:
+                            finalization_failed += 1
 
                         async with lock:
                             filled += 1
-                            if res.get("status") == "FAILED":
+                            if macro_failed:
                                 failed_macros += 1
 
                     except Exception:
@@ -1719,6 +1930,11 @@ async def ElrajhiRetryByReportIds(
         }
 
     finally:
+        if automation_surface_page is not None and not new_browser:
+            try:
+                await automation_surface_page.close()
+            except Exception:
+                pass
         if new_browser:
             new_browser.stop()
 
@@ -1732,6 +1948,7 @@ async def ElrajhiRetryByRecordIds(
     finalize_submission=False,
 ):
     new_browser = None
+    automation_surface_page = None
     try:
         if not record_ids:
             return {"status": "FAILED", "error": "record_ids array is empty"}
@@ -1808,8 +2025,14 @@ async def ElrajhiRetryByRecordIds(
             finalize_submission=finalize_submission,
         )
 
-        new_browser = await spawn_new_browser(browser, headless=False)
-        main_page = new_browser.main_tab
+        workflow_browser, main_page, new_browser = await open_workflow_page(
+            browser,
+            force_spawn=True,
+            headless=False,
+        )
+        if workflow_browser is None or main_page is None:
+            return {"status": "FAILED", "error": "Could not open Taqeem action browser."}
+        automation_surface_page = main_page
 
         macros_to_fill = []
         results = []
@@ -1893,10 +2116,11 @@ async def ElrajhiRetryByRecordIds(
         # ---- PHASE 3: MACRO FILLING ----
         if macros_to_fill:
             process_state.total += len(macros_to_fill)
-            pages = [main_page] + [
-                await new_browser.get("about:blank", new_tab=True)
-                for _ in range(min(tabs_num, len(macros_to_fill)) - 1)
-            ]
+            pages = await open_workflow_pages(
+                workflow_browser,
+                main_page,
+                min(tabs_num, len(macros_to_fill)),
+            )
 
             chunks = balanced_chunks(macros_to_fill, len(pages))
             lock = asyncio.Lock()
@@ -1919,16 +2143,24 @@ async def ElrajhiRetryByRecordIds(
                             macro_form_config["field_types"],
                         )
 
-                        if finalize_submission:
-                            fin = await finalize_report_submission(page, m["report_id"])
-                            if fin["status"] == "SUCCESS":
-                                finalized_reports += 1
-                            else:
-                                finalization_failed += 1
+                        macro_failed = is_macro_fill_failed(res)
+                        if not macro_failed:
+                            completion_result = await complete_macro_report(
+                                page,
+                                m,
+                                finalize_submission,
+                            )
+                            if finalize_submission:
+                                if completion_result.get("finalization_succeeded"):
+                                    finalized_reports += 1
+                                else:
+                                    finalization_failed += 1
+                        elif finalize_submission:
+                            finalization_failed += 1
 
                         async with lock:
                             filled += 1
-                            if res.get("status") == "FAILED":
+                            if macro_failed:
                                 failed_macros += 1
 
                     except Exception:
@@ -1969,6 +2201,11 @@ async def ElrajhiRetryByRecordIds(
         }
 
     finally:
+        if automation_surface_page is not None and not new_browser:
+            try:
+                await automation_surface_page.close()
+            except Exception:
+                pass
         if new_browser:
             new_browser.stop()
 

@@ -358,6 +358,21 @@ async function bootstrapAndSync({
     };
 }
 
+function isTaqeemAuthSuccess(authStatus) {
+    if (authStatus === true) return true;
+    if (authStatus?.success === true) return true;
+    const status = String(authStatus?.status || "").toUpperCase();
+    return (
+        status === "SUCCESS" ||
+        status === "CHECK" ||
+        status === "AUTHORIZED" ||
+        status === "SYNCED" ||
+        status === "LOGIN_SUCCESS" ||
+        status === "NORMAL_ACCOUNT" ||
+        status === "BOOTSTRAP_GRANTED"
+    );
+}
+
 async function ensureTaqeemAuthorized(
     token,
     onViewChange,
@@ -373,19 +388,22 @@ async function ensureTaqeemAuthorized(
         guestAccessEnabled,
         cachedUser = null,
         selectedCompanyOfficeId = null,
+        disableAppAuthRedirects = false,
     } = options || {};
 
     const userSnapshot = resolveCachedUser(cachedUser);
     const suppressSystemRedirect = isGuest && guestAccessEnabled !== undefined;
-    const canRedirect = allowLoginRedirect && typeof onViewChange === "function";
+    const canRedirect = allowLoginRedirect && typeof onViewChange === "function" && !disableAppAuthRedirects;
 
     const redirectToSystemLogin = (force = false) => {
+        if (disableAppAuthRedirects) return;
         if (canRedirect && (force || !suppressSystemRedirect)) {
             onViewChange("login");
         }
     };
 
     const redirectToRegistration = () => {
+        if (disableAppAuthRedirects) return;
         if (canRedirect && !suppressSystemRedirect) {
             onViewChange("registration");
         }
@@ -531,7 +549,7 @@ async function ensureTaqeemAuthorized(
             return true;
         }
 
-        onViewChange?.("taqeem-login");
+        if (!disableAppAuthRedirects) onViewChange?.("taqeem-login");
         return false;
     } catch (err) {
         const conflictData = err?.response?.data;
@@ -560,9 +578,13 @@ async function ensureTaqeemAuthorized(
         }
 
         setTaqeemStatus?.("info", "Taqeem login: Off");
-        onViewChange?.("taqeem-login");
+        if (!disableAppAuthRedirects) onViewChange?.("taqeem-login");
         return false;
     }
 }
 
-module.exports = { ensureTaqeemAuthorized };
+module.exports = {
+    ensureTaqeemAuthorized,
+    extractTaqeemUsernameFromUser,
+    isTaqeemAuthSuccess,
+};

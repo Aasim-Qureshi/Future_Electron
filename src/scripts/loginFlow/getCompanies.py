@@ -472,7 +472,7 @@ async def get_companies():
 
         print(f"[INFO] Total companies found: {len(companies)}", file=sys.stderr)
 
-        valuers_by_office = {}
+        # Companies only — no Taqeem valuer scraping (valuers come from Excel when needed).
         for company in companies:
             office_id = str(
                 company.get("officeId")
@@ -484,24 +484,10 @@ async def get_companies():
                 or company.get("sector_id")
                 or "4"
             ).strip() or "4"
-
-            if not office_id:
-                company["valuers"] = []
-                print(
-                    f"[WARN] Skipping valuers for company {company.get('name')}: missing office id",
-                    file=sys.stderr,
-                )
-                continue
-
-            # Avoid duplicated scrape operations for the same office id.
-            if office_id in valuers_by_office:
-                company["valuers"] = valuers_by_office[office_id]
-                continue
-
-            company["officeId"] = office_id
+            if office_id:
+                company["officeId"] = office_id
             company["sectorId"] = sector_id
-            company["valuers"] = await fetch_company_valuers(page, office_id=office_id, sector_id=sector_id)
-            valuers_by_office[office_id] = company["valuers"]
+            company["valuers"] = []
 
         try:
             await page.get(final_home_url)
@@ -509,7 +495,7 @@ async def get_companies():
         except Exception:
             pass
 
-        print(f"[INFO] Total companies with valuers: {len(companies)}", file=sys.stderr)
+        print(f"[INFO] Total companies (no valuer fetch): {len(companies)}", file=sys.stderr)
         return {"status": "SUCCESS", "data": companies}
     except Exception as e:
         print(f"[ERROR] Error getting companies: {e}", file=sys.stderr)

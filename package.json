@@ -4,6 +4,10 @@
   "description": "Electron + Python desktop app",
   "author": "",
   "license": "ISC",
+  "sideEffects": [
+    "**/*.css",
+    "./src/ui/index.css"
+  ],
   "type": "commonjs",
   "main": "src/main.js",
   "scripts": {
@@ -78,7 +82,6 @@
   "dependencies": {
     "@napi-rs/canvas": "^0.1.84",
     "axios": "^1.13.2",
-    "docx": "^9.5.1",
     "dotenv": "^17.2.3",
     "exceljs": "^4.4.0",
     "i18next": "^25.7.3",
@@ -87,8 +90,8 @@
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-i18next": "^16.5.0",
-    "react-router-dom": "^7.12.0",
-    "socket.io-client": "^4.7.5"
+    "socket.io-client": "^4.7.5",
+    "xml-js": "^1.6.11"
   },
   "devDependencies": {
     "@babel/core": "^7.28.5",

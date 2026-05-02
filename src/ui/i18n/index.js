@@ -1,4 +1,5 @@
-const i18n = require('i18next');
+const i18nextModule = require('i18next');
+const i18n = i18nextModule?.default ?? i18nextModule;
 const { initReactI18next } = require('react-i18next');
 const en = require('./translations/en.json');
 const ar = require('./translations/ar.json');

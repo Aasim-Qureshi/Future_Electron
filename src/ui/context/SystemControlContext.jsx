@@ -26,7 +26,7 @@ const DEFAULT_STATE = {
     ramTabsPerGb: 5
 };
 
-const DEMO_MODULES = ['apps', 'taqeem-login', 'profile', 'asset-create', 'packages', 'get-companies'];
+const DEMO_MODULES = ['apps', 'taqeem-login', 'profile', 'asset-create', 'submit-reports-quickly', 'get-companies'];
 const isGroupId = (viewId) => Boolean(valueSystemGroups?.[viewId]);
 const groupHasAllowedTab = (groupId, list) =>
     valueSystemGroups?.[groupId]?.tabs?.some((tab) => list.includes(tab.id));

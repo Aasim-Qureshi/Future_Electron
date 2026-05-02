@@ -3,6 +3,9 @@ import { Bell, FileText, Inbox, MessageCircle, Package as PackageIcon, RefreshCc
 import { useTranslation } from 'react-i18next';
 import { useNotifications } from '../context/NotificationContext';
 import { useSession } from '../context/SessionContext';
+import navigation from '../constants/navigation';
+
+const { DEFAULT_HOME_VIEW } = navigation;
 
 const levelStyles = {
     info: 'bg-sky-400',
@@ -112,7 +115,7 @@ const NotificationBell = ({ onViewChange, mode = 'unread' }) => {
                 })
             );
             if (onViewChange) {
-                onViewChange(targetView || "packages");
+                onViewChange(targetView || DEFAULT_HOME_VIEW);
             }
             setOpen(false);
             return;

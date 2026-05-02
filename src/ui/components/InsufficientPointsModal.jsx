@@ -1,5 +1,8 @@
 import React from "react";
 import { X } from "lucide-react"; // Add X icon import
+import navigation from "../constants/navigation";
+
+const { DEFAULT_HOME_VIEW } = navigation;
 
 const InsufficientPointsModal = ({ viewChange, onClose, details = {} }) => {
     const { assetCount, requiredPoints, availablePoints, customMessage } = details;
@@ -16,7 +19,7 @@ const InsufficientPointsModal = ({ viewChange, onClose, details = {} }) => {
         : `You need ${requiredLabel}${hasAssetCount ? ` for ${assetLabel}` : ''} to continue.`;
     const secondaryMessage = availableLabel
         ? `You currently have ${availableLabel}.`
-        : 'Please purchase a package to continue.';
+        : "You can continue from the reports upload area.";
     return (
         <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm p-6 relative border border-gray-200">
             {/* Close button */}
@@ -50,10 +53,10 @@ const InsufficientPointsModal = ({ viewChange, onClose, details = {} }) => {
                     className="flex-1 rounded-xl px-4 py-2 font-medium bg-blue-600 text-white hover:bg-blue-700 transition"
                     onClick={() => {
                         onClose(); // Close modal first
-                        viewChange("packages"); // Then navigate
+                        viewChange(DEFAULT_HOME_VIEW);
                     }}
                 >
-                    Go to Packages
+                    Go to reports
                 </button>
             </div>
         </div>

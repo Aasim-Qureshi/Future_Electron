@@ -12,7 +12,11 @@ module.exports = {
     "./*.{js,jsx,ts,tsx,html}"
   ],
   theme: {
-    extend: {},
+    extend: {
+      fontFamily: {
+        sans: ['Tajawal', 'system-ui', 'sans-serif'],
+      },
+    },
   },
   plugins: [],
 }

@@ -77,7 +77,8 @@ class AuthCommands {
             loginUrl,
             onlyIfClosed: options.onlyIfClosed !== false,
             navigateIfOpen: !!options.navigateIfOpen,
-            forceNew: !!options.forceNew
+            forceNew: !!options.forceNew,
+            skipStatusCheck: !!options.skipStatusCheck
         });
     }
 

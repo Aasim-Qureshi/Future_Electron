@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Sora:wght@300;400;500;600&family=Noto+Sans+Arabic:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;600;700;800&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -6,17 +6,15 @@
 
 @layer base {
     :root {
-        --font-display: "Space Grotesk", "Sora", sans-serif;
-        --font-body: "Sora", "Space Grotesk", sans-serif;
-        --font-ar: "Noto Sans Arabic", "Noto Naskh Arabic", "Tahoma", sans-serif;
-        --app-bg: radial-gradient(1200px 520px at 8% -10%, rgba(14, 165, 233, 0.14), transparent 60%),
-            radial-gradient(1000px 520px at 92% 0%, rgba(16, 185, 129, 0.12), transparent 58%),
-            linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
-        --ink-strong: #0f172a;
-        --ink-muted: #475569;
+        --font-display: "Tajawal", system-ui, sans-serif;
+        --font-body: "Tajawal", system-ui, sans-serif;
+        --font-ar: "Tajawal", system-ui, sans-serif;
+        --app-bg: linear-gradient(180deg, #f4f4f5 0%, #ececee 100%);
+        --ink-strong: #171717;
+        --ink-muted: #525252;
         --surface: #ffffff;
-        --surface-muted: rgba(255, 255, 255, 0.7);
-        --accent: #0ea5e9;
+        --surface-muted: rgba(255, 255, 255, 0.82);
+        --accent: #262626;
     }
 
     html,
@@ -25,11 +23,13 @@
         height: 100%;
         overflow-x: hidden;
         max-width: 100%;
+        font-family: var(--font-body);
     }
 
     html {
         overflow-x: hidden;
         width: 100%;
+        font-family: var(--font-body);
     }
 
     body {
@@ -138,6 +138,45 @@
     [dir="rtl"] table th.text-left,
     [dir="rtl"] table td.text-left {
         text-align: right;
+    }
+
+    /* Batches table + nested reports: Tajawal, clearer Arabic spacing */
+    .batch-reports-panel {
+        font-family: "Tajawal", var(--font-ar), system-ui, sans-serif;
+        font-size: 0.875rem;
+        line-height: 1.6;
+        font-feature-settings: "kern" 1;
+        -webkit-font-smoothing: antialiased;
+    }
+
+    .batch-reports-panel table {
+        font-family: inherit;
+    }
+
+    .batch-reports-panel .batch-nested-table {
+        table-layout: fixed;
+        width: 100%;
+    }
+
+    .batch-reports-panel .batch-nested-table td {
+        overflow-wrap: anywhere;
+        word-break: break-word;
+    }
+
+    .batch-reports-panel select,
+    .batch-reports-panel option,
+    .batch-reports-panel button {
+        font-family: inherit;
+    }
+
+    html[dir="rtl"] .batch-reports-panel {
+        word-spacing: 0.045em;
+        letter-spacing: 0;
+    }
+
+    .batch-reports-panel .batch-main-table thead th,
+    .batch-reports-panel .batch-nested-table thead th {
+        font-weight: 600;
     }
 
     @media (prefers-reduced-motion: reduce) {

@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavStatus } from './NavStatusContext';
 import usePersistentState from '../hooks/usePersistentState';
 
-const { valueSystemCards, valueSystemGroups, findTabInfo } = navigation;
+const { valueSystemCards, valueSystemGroups, findTabInfo, DEFAULT_HOME_VIEW } = navigation;
 
 const ValueNavContext = createContext(null);
 
@@ -96,16 +96,20 @@ export const ValueNavProvider = ({ children }) => {
     const { taqeemStatus, setCompanyStatus, setTaqeemStatus } = useNavStatus();
     const [selectedCard, setSelectedCard] = useState(null);
     const [selectedDomain, setSelectedDomain] = useState(null);
-    const [selectedCompany, setSelectedCompanyState] = usePersistentState('nav:selected-company', null, {
-        storage: 'session',
-        revive: (value) => normalizeCompany(value)
-    });
     const preferredCompanyStorageKey = useMemo(
         () => resolvePreferredCompanyStorageKey(user, isGuest),
         [isGuest, user]
     );
+    const selectedCompanyStorageKey = useMemo(
+        () => `${preferredCompanyStorageKey}:selected-office`,
+        [preferredCompanyStorageKey]
+    );
     const [preferredCompanyKey, setPreferredCompanyKey] = usePersistentState(preferredCompanyStorageKey, '', {
         storage: 'local'
+    });
+    const [selectedCompany, setSelectedCompanyState] = usePersistentState(selectedCompanyStorageKey, null, {
+        storage: 'local',
+        revive: (value) => normalizeCompany(value)
     });
     const [companies, setCompanies] = useState([]);
     const companiesRef = useRef(companies);
@@ -118,6 +122,25 @@ export const ValueNavProvider = ({ children }) => {
     );
     const [companySyncDone, setCompanySyncDone] = useState(false);
     const [autoLoadedCompanies, setAutoLoadedCompanies] = useState(false);
+
+    useEffect(() => {
+        if (typeof window === 'undefined' || !window.sessionStorage) return;
+        try {
+            const raw = window.sessionStorage.getItem('nav:selected-company');
+            if (raw == null || raw === undefined) return;
+            const parsed = JSON.parse(raw);
+            const revived = normalizeCompany(parsed);
+            window.sessionStorage.removeItem('nav:selected-company');
+            if (!revived) return;
+            setSelectedCompanyState((prev) => prev || revived);
+        } catch {
+            try {
+                window.sessionStorage.removeItem('nav:selected-company');
+            } catch {
+                /* ignore */
+            }
+        }
+    }, [setSelectedCompanyState]);
 
     useEffect(() => {
         companiesRef.current = companies;
@@ -346,21 +369,57 @@ export const ValueNavProvider = ({ children }) => {
         return list;
     }, [applyCompaniesMeta, authHeaders, extractCompaniesMeta, loadSavedCompanies, normalizeCompanyList, t, user]);
 
+    const refreshCompaniesFromTaqeem = useCallback(async () => {
+        if (!window?.electronAPI?.getCompanies) {
+            setCompanyError(t('navigation.companyFetchUnavailable'));
+            return { ok: false };
+        }
+        setLoadingCompanies(true);
+        setCompanyError('');
+        try {
+            const data = await window.electronAPI.getCompanies();
+            if (data?.status !== 'SUCCESS') {
+                setCompanyError(data?.error || t('navigation.loadCompaniesFailed'));
+                return { ok: false };
+            }
+            const fetched = (data.data || []).map((raw) => {
+                const n = normalizeCompany(raw);
+                return { ...n, valuers: [] };
+            });
+            setCompanies(fetched);
+            if (user && token && window.electronAPI.apiRequest) {
+                try {
+                    await syncCompanies(
+                        fetched.map((c) => ({ ...c, type: c.type || 'equipment' })),
+                        'equipment'
+                    );
+                } catch (syncErr) {
+                    console.warn('[Companies] sync to server failed', syncErr);
+                }
+            }
+            setCompanyStatus(
+                'success',
+                t('navigation.companiesSynced', { defaultValue: 'تم جلب وتحديث الشركات' })
+            );
+            return { ok: true, count: fetched.length };
+        } catch (err) {
+            const msg = err?.message || t('navigation.loadCompaniesFailed');
+            setCompanyError(msg);
+            return { ok: false, error: msg };
+        } finally {
+            setLoadingCompanies(false);
+        }
+    }, [user, token, syncCompanies, t, setCompanyStatus]);
+
     useEffect(() => {
-        if (user) {
+        if (user && token) {
             loadSavedCompanies();
-        } else {
+        } else if (!user) {
             setCompanies([]);
             setCompanyError('');
             setAutoLoadedCompanies(false);
         }
-    }, [user, loadSavedCompanies]);
-
-    useEffect(() => {
-        if (taqeemStatus?.state === 'success' && (!companies || companies.length === 0)) {
-            loadSavedCompanies(selectedDomain || 'equipment');
-        }
-    }, [companies, loadSavedCompanies, selectedDomain, taqeemStatus?.state]);
+    }, [user, token, loadSavedCompanies]);
 
     useEffect(() => {
         if (taqeemStatus?.state !== 'success') {
@@ -542,47 +601,6 @@ export const ValueNavProvider = ({ children }) => {
     }, [defaultCompanyOfficeId, preferredCompanyMatches, setSelectedCompany]);
 
     useEffect(() => {
-        const shouldAutoFetch =
-            taqeemStatus?.state === 'success' &&
-            !loadingCompanies &&
-            !autoLoadedCompanies &&
-            (!companies || companies.length === 0);
-        if (!shouldAutoFetch) return;
-        if (!window?.electronAPI?.getCompanies) return;
-        setAutoLoadedCompanies(true);
-        (async () => {
-            setLoadingCompanies(true);
-            setCompanyError('');
-            try {
-                const data = await window.electronAPI.getCompanies();
-                if (data?.status === 'SUCCESS') {
-                    const fetched = data.data || [];
-                    const normalized = fetched.map(normalizeCompany);
-                    let synced = normalized;
-                    if (syncCompanies && normalized.length > 0) {
-                        try {
-                            const syncedRes = await syncCompanies(normalized.map((c) => ({ ...c, type: c.type || 'equipment' })), 'equipment');
-                            if (Array.isArray(syncedRes) && syncedRes.length > 0) {
-                                synced = syncedRes.map(normalizeCompany);
-                            }
-                        } catch (err) {
-                            console.warn('Failed to sync companies', err);
-                        }
-                    }
-                    await replaceCompanies(synced, { quiet: true, skipNavigation: true, autoSelect: true });
-                    setCompanyStatus('info', t('sidebar.company.selectToContinue', { defaultValue: 'Select a company to view main links.' }));
-                } else {
-                    setCompanyError(data?.error || t('navigation.loadCompaniesFailed'));
-                }
-            } catch (err) {
-                setCompanyError(err?.message || t('navigation.loadCompaniesFailed'));
-            } finally {
-                setLoadingCompanies(false);
-            }
-        })();
-    }, [autoLoadedCompanies, companies, loadingCompanies, replaceCompanies, setCompanyStatus, syncCompanies, taqeemStatus?.state, t]);
-
-    useEffect(() => {
         if (taqeemStatus?.state !== 'success') {
             setCompanySyncDone(false);
             return;
@@ -633,6 +651,13 @@ export const ValueNavProvider = ({ children }) => {
     }, [autoSelectDefaultCompany, companies, selectedCompany]);
 
     const syncNavForView = useCallback((viewId) => {
+        if (viewId === 'system-settings') {
+            setSelectedCard(null);
+            setSelectedDomain(null);
+            setActiveGroup(null);
+            setActiveTab('system-settings');
+            return;
+        }
         const info = findTabInfo(viewId);
         if (!info) {
             setActiveTab(null);
@@ -656,7 +681,12 @@ export const ValueNavProvider = ({ children }) => {
     }, [selectedDomain]);
 
     const breadcrumbs = useMemo(() => {
-        const items = [{ label: t('navigation.apps'), key: 'apps' }];
+        const items = [
+      {
+        label: t("navigation.uploadRoot", { defaultValue: "رفع التقارير" }),
+        key: DEFAULT_HOME_VIEW,
+      },
+    ];
         if (selectedCard) {
             items.push({ label: getCardLabel(selectedCard), key: selectedCard, kind: 'card' });
         }
@@ -690,7 +720,7 @@ export const ValueNavProvider = ({ children }) => {
             }
         }
         return items;
-    }, [activeGroup, activeTab, getCardLabel, getDomainLabel, selectedCard, selectedCompany, selectedDomain, t]);
+    }, [activeGroup, activeTab, getCardLabel, getDomainLabel, selectedCard, selectedCompany, selectedDomain, t, DEFAULT_HOME_VIEW]);
 
     return (
         <ValueNavContext.Provider
@@ -722,7 +752,8 @@ export const ValueNavProvider = ({ children }) => {
                 breadcrumbs,
                 valueSystemCards,
                 valueSystemGroups,
-                resetNavigation
+                resetNavigation,
+                refreshCompaniesFromTaqeem
             }}
         >
             {children}

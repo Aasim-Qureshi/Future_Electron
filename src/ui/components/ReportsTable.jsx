@@ -28,11 +28,12 @@ import { useSession } from "../context/SessionContext";
 import { useAuthAction } from "../hooks/useAuthAction"; // Add this import
 import { useValueNav } from "../context/ValueNavContext";
 import { useNavStatus } from "../context/NavStatusContext";
+import { extractTaqeemUsernameFromUser } from "../../shared/helper/taqeemAuthWrap";
 import EditAssetModal from "./EditAssetModal";
 
 const REPORTS_TABLE_PAGE_NAME = "Reports Table";
 
-const ReportsTable = ({ onViewChange, showTemporary = true }) => {
+const ReportsTable = ({ onViewChange }) => {
   const { t } = useTranslation();
   const quickTranslate = useCallback(
     (key, defaultValue, options = {}) =>
@@ -45,8 +46,6 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
     [t],
   );
   const [reports, setReports] = useState([]);
-  const [unassignedReports, setUnassignedReports] = useState([]);
-  const [unassignedLoading, setUnassignedLoading] = useState(false);
   const [flowPaused, setFlowPaused] = useState({});
   const [assetFilter, setAssetFilter] = useState("all");
   const [actionDropdown, setActionDropdown] = useState({});
@@ -73,7 +72,7 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
     useState(false); // Add this state
   const [submitProgress, setSubmitProgress] = useState({});
   const pendingCompanySelectionRef = useRef(null);
-  const { token, user, isGuest } = useSession();
+  const { token, user } = useSession();
   const { executeWithAuth } = useAuthAction(); // Add this hook
   const {
     selectedCompany,
@@ -88,18 +87,7 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
     selectedCompany?.officeId || selectedCompany?.office_id || "";
   const { ramInfo } = useRam();
   const tabsNum = ramInfo?.recommendedTabs || 1;
-  const isGuestUser = isGuest || !user?.phone;
-  const temporaryReports = isGuestUser ? allReports : unassignedReports;
-  const temporaryLoading = isGuestUser ? loading : unassignedLoading;
-  const showTemporarySection =
-    isGuestUser || unassignedLoading || unassignedReports.length > 0;
-  const shouldShowTemporary = showTemporary && showTemporarySection;
-  const temporaryTitle = isGuestUser
-    ? quickTranslate("temporarySection.title", "Guest Temporary Reports")
-    : quickTranslate("temporaryModal.title", "Temporary Reports");
-  const temporaryHint = isGuestUser
-    ? quickTranslate("temporaryModal.guestSession", "Guest temporary reports.")
-    : quickTranslate("temporaryModal.unassigned", "Unassigned reports.");
+  const taqeemLinked = Boolean(extractTaqeemUsernameFromUser(user || {}));
 
   // Add this useEffect to listen for progress updates
   useEffect(() => {
@@ -255,9 +243,7 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
 
   const handleSubmitToTaqeem = async (reportId) => {
     // Find the report to check status
-    const report =
-      allReports.find((r) => r.report_id === reportId) ||
-      unassignedReports.find((r) => r.report_id === reportId);
+    const report = allReports.find((r) => r.report_id === reportId);
     if (!report) return;
 
     const status = getReportStatus(report);
@@ -306,13 +292,7 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
                   },
                 );
                 report.company_office_id = String(officeId);
-                setUnassignedReports((prev) =>
-                  prev.filter((item) => item?._id !== report._id),
-                );
                 await fetchAllReports(authToken);
-                if (showTemporary) {
-                  await fetchUnassignedReports(authToken);
-                }
               } catch (err) {
                 console.warn(
                   "[ReportsTable] Failed to update company office id",
@@ -406,7 +386,6 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
         if (result?.success) {
           setSuccess(result.message);
           fetchAllReports();
-          fetchUnassignedReports();
         }
       })
       .catch((error) => {
@@ -686,19 +665,37 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
 
       if (!activeToken) return;
 
+      if (!taqeemLinked) {
+        setAllReports([]);
+        setTotalPages(1);
+        setTotalItems(0);
+        setFilteredReports([]);
+        setReports([]);
+        setError("");
+        return;
+      }
+
+      if (!selectedCompanyOfficeId) {
+        setAllReports([]);
+        setTotalPages(1);
+        setTotalItems(0);
+        setFilteredReports([]);
+        setReports([]);
+        setError("");
+        return;
+      }
+
       const params = new URLSearchParams({
         page: currentPage.toString(),
         limit: pageSize.toString(),
         sortBy: "createdAt",
         sortOrder: "desc",
+        companyOfficeId: String(selectedCompanyOfficeId),
       });
-      if (selectedCompanyOfficeId && !isGuestUser) {
-        params.append("companyOfficeId", String(selectedCompanyOfficeId));
-      }
 
       const result = await window.electronAPI.apiRequest(
         "GET",
-        `/api/report/getReportsByUserId?${params.toString()}`,
+        `/api/submit-reports-quickly/user?${params.toString()}`,
         {},
         {
           Authorization: `Bearer ${activeToken}`,
@@ -706,11 +703,17 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
       );
 
       if (result.success) {
-        setAllReports(result.data);
-        setTotalPages(result.pagination.totalPages);
-        setTotalItems(result.pagination.totalItems);
+        const rows = Array.isArray(result.data)
+          ? result.data
+          : Array.isArray(result.reports)
+            ? result.reports
+            : [];
+        setAllReports(rows);
+        const pg = result.pagination || {};
+        setTotalPages(pg.totalPages || 1);
+        setTotalItems(pg.totalItems ?? pg.total ?? rows.length);
 
-        applyFilters(result.data);
+        applyFilters(rows);
       } else {
         setError(
           (result?.message || "")
@@ -721,59 +724,12 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
     } catch (err) {
       console.error("Error fetching reports:", err);
       setError(
-        (result?.message || "")
-          .replace(/^Error invoking remote method '[^']+':\s*/i, "")
-          .replace(/^Error:\s*/i, "") || "Failed to fetch reports",
+        (err?.message || "")
+            .replace(/^Error invoking remote method '[^']+':\s*/i, "")
+            .replace(/^Error:\s*/i, "") || "Failed to fetch reports",
       );
     } finally {
       setLoading(false);
-    }
-  };
-
-  const fetchUnassignedReports = async (overrideToken) => {
-    try {
-      const activeToken = overrideToken || token;
-      if (!activeToken) {
-        setUnassignedReports([]);
-        return [];
-      }
-      if (isGuestUser) {
-        setUnassignedReports([]);
-        return [];
-      }
-      setUnassignedLoading(true);
-
-      const params = new URLSearchParams({
-        page: "1",
-        limit: String(Math.max(20, pageSize || 20)),
-        sortBy: "createdAt",
-        sortOrder: "desc",
-        unassigned: "true",
-      });
-
-      const result = await window.electronAPI.apiRequest(
-        "GET",
-        `/api/report/getReportsByUserId?${params.toString()}`,
-        {},
-        {
-          Authorization: `Bearer ${activeToken}`,
-        },
-      );
-
-      if (result?.success) {
-        const rows = Array.isArray(result.data) ? result.data : [];
-        setUnassignedReports(rows);
-        return rows;
-      }
-
-      setUnassignedReports([]);
-      return [];
-    } catch (err) {
-      console.warn("[ReportsTable] Failed to fetch unassigned reports:", err);
-      setUnassignedReports([]);
-      return [];
-    } finally {
-      setUnassignedLoading(false);
     }
   };
 
@@ -829,17 +785,11 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
 
   useEffect(() => {
     fetchAllReports();
-  }, [currentPage, pageSize, selectedCompanyOfficeId, isGuestUser]);
-
-  useEffect(() => {
-    if (showTemporary) {
-      fetchUnassignedReports();
-    }
-  }, [token, pageSize, isGuestUser, showTemporary]);
+  }, [currentPage, pageSize, selectedCompanyOfficeId, taqeemLinked, token]);
 
   useEffect(() => {
     setCurrentPage(1);
-  }, [selectedCompanyOfficeId, isGuestUser]);
+  }, [selectedCompanyOfficeId, taqeemLinked]);
 
   useEffect(() => {
     applyFilters();
@@ -1053,9 +1003,6 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
       const tokenObj = await window.electronAPI.getToken?.();
       const activeToken = tokenObj?.refreshToken || tokenObj?.token;
       fetchAllReports(activeToken);
-      if (showTemporary) {
-        fetchUnassignedReports(activeToken);
-      }
     };
 
     window.addEventListener("refreshReportsTable", handleRefreshEvent);
@@ -1070,46 +1017,7 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
       window.removeEventListener("refreshReportsTable", handleRefreshEvent);
       document.removeEventListener("click", handleClickOutside);
     };
-  }, [showTemporary]);
-
-  const ensureGuestSession = async () => {
-    if (token) return token;
-    if (!window?.electronAPI?.apiRequest) {
-      throw new Error("Desktop integration unavailable. Restart the app.");
-    }
-
-    const tokenObj = await window.electronAPI.getToken?.();
-    const bearer = tokenObj?.refreshToken || tokenObj?.token;
-    const headers = bearer ? { Authorization: `Bearer ${bearer}` } : {};
-
-    const result = await window.electronAPI.apiRequest(
-      "POST",
-      "/api/users/guest",
-      {},
-      headers,
-    );
-    if (!result?.token || !result?.userId) {
-      throw new Error(
-        result?.message || result?.error || "Failed to create guest session.",
-      );
-    }
-
-    if (result?.refreshToken && window.electronAPI?.setRefreshToken) {
-      try {
-        await window.electronAPI.setRefreshToken(result.refreshToken, {
-          name: "refreshToken",
-          maxAgeDays: 7,
-          sameSite: "lax",
-        });
-      } catch (err) {
-        console.warn("Failed to set refresh token for guest session:", err);
-      }
-    }
-
-    const guestUser = { _id: result.userId, id: result.userId, guest: true };
-    login(guestUser, result.token);
-    return result.token;
-  };
+  }, []);
 
   return (
     <div className="min-h-screen bg-gray-50 py-3 px-3">
@@ -1219,132 +1127,6 @@ const ReportsTable = ({ onViewChange, showTemporary = true }) => {
             </div>
           </div>
         </div>
-
-        {shouldShowTemporary && (
-          <div className="bg-amber-50 border border-amber-200 rounded-md p-3 shadow-sm">
-            <div className="flex items-center justify-between mb-2">
-              <div>
-                <h2 className="text-sm font-semibold text-amber-900">
-                  {temporaryTitle}
-                </h2>
-                <p className="text-[10px] text-amber-700">
-                  {temporaryHint}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() =>
-                  (isGuestUser ? fetchAllReports() : fetchUnassignedReports())
-                }
-                disabled={temporaryLoading}
-                className="inline-flex items-center gap-1.5 rounded-md border border-amber-300 bg-white px-2 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-60"
-              >
-                <RefreshCcw
-                  className={`w-3 h-3 ${
-                    temporaryLoading ? "animate-spin" : ""
-                  }`}
-                />
-                {temporaryLoading
-                  ? quickTranslate("temporaryModal.refreshing", "Refreshing...")
-                  : quickTranslate("temporaryModal.refresh", "Refresh")}
-              </button>
-            </div>
-            {temporaryLoading ? (
-              <div className="flex items-center gap-2 text-xs text-amber-800">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                {quickTranslate(
-                  "temporaryModal.loading",
-                  "Loading guest temporary reports...",
-                )}
-              </div>
-            ) : temporaryReports.length === 0 ? (
-              <div className="text-xs text-amber-800">
-                {quickTranslate("temporaryModal.empty", "No guest temporary reports found.")}
-              </div>
-            ) : (
-              <div className="overflow-x-auto">
-                <table className="upload-report-table min-w-full text-xs text-gray-700">
-                  <thead className="bg-amber-100 text-amber-900 uppercase">
-                    <tr>
-                      <th className="px-3 py-2 text-left font-semibold">
-                        {quickTranslate("temporaryModal.table.reportId", "Report ID")}
-                      </th>
-                      <th className="px-3 py-2 text-left font-semibold">
-                        {quickTranslate("temporaryModal.table.status", "Status")}
-                      </th>
-                      <th className="px-3 py-2 text-left font-semibold">
-                        {quickTranslate("temporaryModal.table.assets", "Assets")}
-                      </th>
-                      <th className="px-3 py-2 text-left font-semibold">
-                        {translate("table.createdDate", "Created Date")}
-                      </th>
-                      <th className="px-3 py-2 text-left font-semibold">
-                        {quickTranslate("temporaryModal.table.action", "Action")}
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-amber-100">
-                    {temporaryReports.map((report) => {
-                      const assetData = getAssetData(report);
-                      const status = getReportStatus(report);
-                      const statusColor = getStatusColor(status);
-                      return (
-                        <tr key={report._id} className="hover:bg-amber-50">
-                          <td className="px-3 py-2 text-xs text-gray-800">
-                            {report.report_id ||
-                              quickTranslate("reports.notSubmitted", "Not submit")}
-                          </td>
-                          <td className="px-3 py-2 text-xs">
-                            <span
-                              className={`px-2 py-0.5 rounded-full text-[10px] font-medium border ${statusColor}`}
-                            >
-                              {getLocalizedStatusLabel(status)}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2 text-xs text-gray-700">
-                            {assetData.length}
-                          </td>
-                          <td className="px-3 py-2 text-xs text-gray-700">
-                            {formatDate(report.createdAt)}
-                          </td>
-                          <td className="px-3 py-2 text-xs">
-                            <button
-                              type="button"
-                              onClick={() => handleSubmitToTaqeem(report.report_id)}
-                              className="inline-flex items-center gap-1.5 rounded-md bg-amber-600 px-2 py-1 text-[10px] font-semibold text-white hover:bg-amber-700"
-                            >
-                              {quickTranslate(
-                                "temporaryModal.assignAndSubmit",
-                                "Assign & Submit",
-                              )}
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            {isGuestUser && (
-              <div className="mt-2 flex items-center justify-between rounded-md border border-amber-200 bg-amber-100/60 px-2 py-1 text-[10px] text-amber-900">
-                <span>
-                  {quickTranslate(
-                    "temporaryModal.registerHint",
-                    "Register your account to keep these reports linked to your phone.",
-                  )}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => onViewChange?.("registration")}
-                  className="rounded-md bg-amber-700 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-amber-800"
-                >
-                  {quickTranslate("temporaryModal.register", "Register")}
-                </button>
-              </div>
-            )}
-          </div>
-        )}
 
         {/* Reports Table - Made more compact */}
         <div className="bg-white border border-gray-200 rounded-md shadow-sm overflow-hidden">

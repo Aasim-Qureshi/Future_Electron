@@ -11,8 +11,10 @@ import { io } from "socket.io-client";
 import { useSession } from "./SessionContext";
 
 const NotificationContext = createContext(null);
-const SOCKET_URL = "http://167.71.231.64:3000";
-// const SOCKET_URL = 'http://localhost:3000';
+const SOCKET_URL =
+  (typeof process !== "undefined" && process?.env?.REACT_APP_BACKEND_URL) ||
+  (typeof process !== "undefined" && process?.env?.BACKEND_URL) ||
+  "http://localhost:3000";
 const DEFAULT_LIMIT = 12;
 const MAX_BUFFER = 50;
 const POLL_INTERVAL_MS = 15000;

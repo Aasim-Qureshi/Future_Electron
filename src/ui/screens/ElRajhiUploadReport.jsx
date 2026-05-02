@@ -1,5 +1,5 @@
-import React, { use, useEffect, useMemo, useRef, useState } from "react";
-import axios from "axios";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import ExcelJS from "exceljs/dist/exceljs.min.js";
 import {
   uploadElrajhiBatch,
@@ -12,10 +12,19 @@ import { useElrajhiUpload } from "../context/ElrajhiUploadContext";
 import EditReportModal from "../components/EditReportModal";
 import { useRam } from "../context/RAMContext";
 import { useSession } from "../context/SessionContext";
+import { useNavStatus } from "../context/NavStatusContext";
+import { useSystemControl } from "../context/SystemControlContext";
+import {
+  ensureTaqeemAuthorized,
+  isTaqeemAuthSuccess,
+} from "../../shared/helper/taqeemAuthWrap";
 import { useValueNav } from "../context/ValueNavContext";
+import { recordUploadBatch } from "../utils/reportUploadStats";
 import { downloadTemplateFile } from "../utils/templateDownload";
+import excelIconImg from "../../../public/images/excelicon.png";
 import { useAuthAction } from "../hooks/useAuthAction";
 import InsufficientPointsModal from "../components/InsufficientPointsModal";
+import { useTranslation } from "react-i18next";
 
 import {
   FileSpreadsheet,
@@ -61,6 +70,23 @@ const normalizeKey = (value) =>
     .trim()
     .toLowerCase()
     .replace(/[\W_]+/g, "");
+
+const PDF_MATCH_ASSET_NAMES_MAX = 15;
+
+/** Build list of asset names missing a matched PDF filename (manual upload flow). */
+const summarizeUnmatchedPdfAssets = (
+  rows,
+  { separator = ", ", maxNames = PDF_MATCH_ASSET_NAMES_MAX } = {},
+) => {
+  const names = rows
+    .filter((r) => !r.pdf_name)
+    .map((r) => r.asset_name)
+    .filter(Boolean);
+  if (!names.length) return { listPart: "", overflow: 0 };
+  const slice = names.slice(0, maxNames);
+  const overflow = Math.max(0, names.length - slice.length);
+  return { listPart: slice.join(separator), overflow };
+};
 
 const convertArabicDigits = (value) => {
   if (typeof value !== "string") return value;
@@ -179,6 +205,12 @@ const hasValue = (val) =>
   val !== undefined &&
   val !== null &&
   (typeof val === "number" || String(val).toString().trim() !== "");
+
+const getApiErrorMessage = (err, fallback = "Request failed") =>
+  err?.response?.data?.error ||
+  err?.response?.data?.message ||
+  err?.message ||
+  fallback;
 
 const pickFieldValue = (row, candidates = []) => {
   if (!row) return undefined;
@@ -564,8 +596,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     setSendingTaqeem,
     sendingValidation,
     setSendingValidation,
-    pdfOnlySending,
-    setPdfOnlySending,
     loadingValuers,
     setLoadingValuers,
   } = useElrajhiUpload();
@@ -577,6 +607,11 @@ const UploadReportElrajhi = ({ onViewChange }) => {
   const [selectedBulkActions, setSelectedBulkActions] = useState({});
   const { executeWithAuth } = useAuthAction();
   const { selectedCompany } = useValueNav();
+  const { token, login, user, isGuest } = useSession();
+  const { taqeemStatus, setTaqeemStatus } = useNavStatus();
+  const { systemState } = useSystemControl();
+  const { t, i18n } = useTranslation();
+  const pageDir = i18n.dir?.(i18n.resolvedLanguage || i18n.language) || "rtl";
   const selectedCompanyOfficeId = useMemo(() => {
     const officeId = selectedCompany?.officeId || selectedCompany?.office_id;
     return officeId ? String(officeId) : "";
@@ -602,6 +637,77 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       skipNavigation: true,
     };
   }, [selectedCompany]);
+
+  const ensureElrajhiActionReady = async () => {
+    if (!elrajhiCompanyContext) {
+      throw new Error(
+        "Select a company (office) before running ElRajhi actions.",
+      );
+    }
+
+    const isTaqeemLoggedIn = taqeemStatus?.state === "success";
+    const guestSession = isGuest || !token;
+    const officeIdForAuth =
+      selectedCompany?.officeId || selectedCompany?.office_id || null;
+
+    const authStatus = await ensureTaqeemAuthorized(
+      token,
+      onViewChange,
+      isTaqeemLoggedIn,
+      0,
+      login,
+      setTaqeemStatus,
+      {
+        isGuest: guestSession,
+        guestAccessEnabled: systemState?.guestAccessEnabled ?? true,
+        cachedUser: user || null,
+        selectedCompanyOfficeId: officeIdForAuth,
+        disableAppAuthRedirects: true,
+      },
+    );
+
+    if (authStatus?.status === "INSUFFICIENT_POINTS") {
+      setShowInsufficientPointsModal(true);
+      throw new Error(
+        authStatus?.message ||
+          authStatus?.reason ||
+          "Insufficient points for this action.",
+      );
+    }
+
+    if (authStatus?.status === "LOGIN_REQUIRED") {
+      throw new Error(
+        "يجب تسجيل الدخول إلى تقييم أولاً. استخدم حالة «تقييم» في الشريط العلوي أو أكمل الدخول في نافذة المتصفح ثم أعد المحاولة.",
+      );
+    }
+
+    if (!isTaqeemAuthSuccess(authStatus)) {
+      throw new Error(
+        authStatus?.message ||
+          authStatus?.error ||
+          "Taqeem authorization failed. Complete Taqeem login first.",
+      );
+    }
+
+    if (!window?.electronAPI?.checkStatus) {
+      return true;
+    }
+
+    const status = await window.electronAPI.checkStatus();
+    const statusCode = String(status?.status || "").toUpperCase();
+    const isReady = Boolean(
+      status?.browserOpen && statusCode.includes("SUCCESS"),
+    );
+
+    if (!isReady) {
+      throw new Error(
+        status?.error ||
+          "Taqeem connection is off. Turn Taqeem connection on, then retry.",
+      );
+    }
+
+    return true;
+  };
 
   const [showValidationModal, setShowValidationModal] = useState(false);
 
@@ -769,7 +875,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           progressData?.message ||
           `Processing ElRajhi batch: ${completed}/${total || "?"} (${Math.round(percentage)}%)`;
 
-        if (sendingValidation || pdfOnlySending) {
+        if (sendingValidation) {
           setValidationMessage({
             type: failed > 0 ? "info" : "info",
             text: progressText,
@@ -791,7 +897,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     };
   }, [
     currentOperationBatchId,
-    pdfOnlySending,
     sendingTaqeem,
     sendingValidation,
     setError,
@@ -1000,8 +1105,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     return Math.round(totalProgress / reports.length);
   };
 
-  const requirePdfMessage = "Upload PDF first for missing-ID reports.";
-
   const shouldBlockActionsForMissingId = (report) => {
     const status = computeReportStatus(report);
     const reportKey =
@@ -1013,7 +1116,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
   // Pause/Resume/Stop state management
   const [isPausedMain, setIsPausedMain] = useState(false);
   const [isPausedValidation, setIsPausedValidation] = useState(false);
-  const [isPausedPdfOnly, setIsPausedPdfOnly] = useState(false);
   const [isPausedBatchCheck, setIsPausedBatchCheck] = useState(false);
   const [isPausedBatchRetry, setIsPausedBatchRetry] = useState(false);
 
@@ -1024,10 +1126,94 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     setBatchActionLoading((prev) => ({ ...prev, [batchId]: true }));
 
     try {
+      await ensureElrajhiActionReady();
+
       switch (action) {
         case "check-status":
           await runBatchCheck(batchId);
           break;
+
+        case "send-to-approver": {
+          const reportsForFinalize = await ensureBatchReportsLoaded(batchId);
+          const finalizeIds = Array.from(
+            new Set(
+              reportsForFinalize
+                .map((r) => r.report_id || r.reportId)
+                .filter((id) => id && String(id).trim() !== ""),
+            ),
+          );
+          if (!finalizeIds.length) {
+            throw new Error(t("elRajhiUpload.msgNoReportIdsForFinalize"));
+          }
+
+          await executeWithAuth(
+            async () => {
+              if (!window?.electronAPI?.finalizeMultipleReports) {
+                throw new Error(t("elRajhiUpload.desktopIntegrationUnavailable"));
+              }
+
+              setBatchMessage({
+                type: "info",
+                text: t("elRajhiUpload.msgFinalizeBatchInProgress", {
+                  count: finalizeIds.length,
+                }),
+              });
+
+              const result =
+                await window.electronAPI.finalizeMultipleReports(finalizeIds);
+              if (result?.status !== "SUCCESS") {
+                throw new Error(
+                  result?.error || "Finalize multiple reports failed",
+                );
+              }
+
+              await loadBatchReports(batchId);
+              await loadBatchList();
+
+              setBatchMessage({
+                type: "success",
+                text: t("elRajhiUpload.msgBulkFinalizeSuccess", {
+                  count: finalizeIds.length,
+                }),
+              });
+            },
+            { token },
+            {
+              skipAuth: false,
+              requiredPoints: finalizeIds.length,
+              skipNavigateToCompany: true,
+              showInsufficientPointsModal: () =>
+                setShowInsufficientPointsModal(true),
+              onViewChange,
+              onAuthSuccess: () => {
+                console.log(
+                  "Batch send-to-approver (finalize) authentication successful",
+                );
+              },
+              onAuthFailure: (reason) => {
+                console.warn(
+                  "Batch send-to-approver authentication failed:",
+                  reason,
+                );
+                if (
+                  reason !== "INSUFFICIENT_POINTS" &&
+                  reason !== "LOGIN_REQUIRED"
+                ) {
+                  setBatchMessage({
+                    type: "error",
+                    text:
+                      reason?.message ||
+                      t("elRajhiUpload.batchActionFailed", {
+                        action: t("elRajhiUpload.bulkSendApprover"),
+                        batchId,
+                      }),
+                  });
+                }
+              },
+            },
+          );
+          break;
+        }
 
         case "approve-reports":
           if (!window?.electronAPI?.openTaqeemLogin) {
@@ -1038,14 +1224,25 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
           setBatchMessage({
             type: "info",
-            text: `Opening secondary Taqeem login for batch ${batchId}...`,
+            text: t("elRajhiUpload.msgTaqeemOpeningBatch", { batchId }),
           });
 
           {
+            const reports = await ensureBatchReportsLoaded(batchId);
+            const reportIds = buildTaqeemReportIds(reports);
+            if (!reportIds.length) {
+              throw new Error(
+                t("elRajhiUpload.msgNoTaqeemIdsBatch", { batchId }),
+              );
+            }
+
             const result = await window.electronAPI.openTaqeemLogin({
               batchId,
+              reportIds,
+              skipBatchLookup: true,
               preferChrome: false,
               waitForLogin: true,
+              closeAfterAction: true,
             });
 
             if (result?.status !== "SUCCESS") {
@@ -1054,16 +1251,19 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
             const summary = result?.batch;
             const summaryText = summary
-              ? `Processed reports: ${summary.succeeded}/${summary.total} succeeded, ${summary.failed} failed.`
+              ? t("elRajhiUpload.msgTaqeemSummaryShort", {
+                  succeeded: summary.succeeded,
+                  total: summary.total,
+                  failed: summary.failed,
+                })
               : "";
 
             setBatchMessage({
               type: summary?.failed ? "info" : "success",
               text: [
-                result?.message ||
-                  "Opened Taqeem login in a separate browser window.",
+                result?.message || t("elRajhiUpload.taqeemOpenedWindow"),
                 summaryText,
-                "Refreshing status...",
+                t("elRajhiUpload.msgRefreshingStatus"),
               ]
                 .filter(Boolean)
                 .join(" "),
@@ -1093,7 +1293,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
               setIsPausedBatchRetry(false);
               setBatchMessage({
                 type: "info",
-                text: `Retrying batch ${batchId}...`,
+                text: t("elRajhiUpload.msgRetryingBatch", { batchId }),
               });
 
               try {
@@ -1104,16 +1304,17 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                 if (result?.status !== "SUCCESS") {
                   throw new Error(result?.error || "Retry failed");
                 }
-                setBatchMessage({
-                  type: "success",
-                  text: `Retry completed for batch ${batchId}`,
-                });
                 await loadBatchReports(batchId);
                 await loadBatchList();
+
+                setBatchMessage({
+                  type: "success",
+                  text: t("elRajhiUpload.msgRetryBatchSuccess", { batchId }),
+                });
               } catch (err) {
                 setBatchMessage({
                   type: "error",
-                  text: err.message || "Failed to retry batch",
+                  text: err.message || t("elRajhiUpload.msgRetryBatchFailed"),
                 });
                 throw err;
               } finally {
@@ -1123,6 +1324,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             },
             { token },
             {
+              skipAuth: false,
               requiredPoints: 1,
               skipNavigateToCompany: true,
               showInsufficientPointsModal: () =>
@@ -1141,7 +1343,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                     type: "error",
                     text:
                       reason?.message ||
-                      "Authentication failed for batch retry",
+                      t("elRajhiUpload.authFailedBatchRetry"),
                   });
                 }
               },
@@ -1161,7 +1363,8 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         setBatchMessage({
           type: "error",
           text:
-            err?.message || `Failed to execute ${action} for batch ${batchId}`,
+            err?.message ||
+            t("elRajhiUpload.batchActionFailed", { action, batchId }),
         });
       }
     } finally {
@@ -1262,56 +1465,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     }
   };
 
-  // Pause/Resume/Stop handlers for PDF Only flow
-  const handlePausePdfOnly = async () => {
-    if (!validationReports.length) return;
-    const reportBatchId = validationReports[0]?.batchId || batchId;
-    if (!reportBatchId) return;
-    try {
-      await window.electronAPI.pauseElrajiBatch(reportBatchId);
-      setIsPausedPdfOnly(true);
-      setValidationMessage({ type: "info", text: "PDF operation paused" });
-    } catch (err) {
-      setValidationMessage({
-        type: "error",
-        text: "Failed to pause PDF operation",
-      });
-    }
-  };
-
-  const handleResumePdfOnly = async () => {
-    if (!validationReports.length) return;
-    const reportBatchId = validationReports[0]?.batchId || batchId;
-    if (!reportBatchId) return;
-    try {
-      await window.electronAPI.resumeElrajiBatch(reportBatchId);
-      setIsPausedPdfOnly(false);
-      setValidationMessage({ type: "info", text: "PDF operation resumed" });
-    } catch (err) {
-      setValidationMessage({
-        type: "error",
-        text: "Failed to resume PDF operation",
-      });
-    }
-  };
-
-  const handleStopPdfOnly = async () => {
-    if (!validationReports.length) return;
-    const reportBatchId = validationReports[0]?.batchId || batchId;
-    if (!reportBatchId) return;
-    try {
-      await window.electronAPI.stopElrajiBatch(reportBatchId);
-      setIsPausedPdfOnly(false);
-      setPdfOnlySending(false);
-      setValidationMessage({ type: "info", text: "PDF operation stopped" });
-    } catch (err) {
-      setValidationMessage({
-        type: "error",
-        text: "Failed to stop PDF operation",
-      });
-    }
-  };
-
   const handleEditReport = async (updatedData) => {
     // Implement your API call to update the report
     console.log("Updating report:", editingReport, "with data:", updatedData);
@@ -1334,9 +1487,15 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     try {
       await window.electronAPI.pauseElrajiBatch(bId);
       setIsPausedBatchCheck(true);
-      setBatchMessage({ type: "info", text: `Batch check paused for ${bId}` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchCheckPaused", { id: bId }),
+      });
     } catch (err) {
-      setBatchMessage({ type: "error", text: "Failed to pause batch check" });
+      setBatchMessage({
+        type: "error",
+        text: t("elRajhiUpload.batchCheckPauseFailed"),
+      });
     }
   };
 
@@ -1346,9 +1505,15 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     try {
       await window.electronAPI.resumeElrajiBatch(bId);
       setIsPausedBatchCheck(false);
-      setBatchMessage({ type: "info", text: `Batch check resumed for ${bId}` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchCheckResumed", { id: bId }),
+      });
     } catch (err) {
-      setBatchMessage({ type: "error", text: "Failed to resume batch check" });
+      setBatchMessage({
+        type: "error",
+        text: t("elRajhiUpload.batchCheckResumeFailed"),
+      });
     }
   };
 
@@ -1360,9 +1525,15 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       setIsPausedBatchCheck(false);
       setCheckingBatchId(null);
       setCheckingAllBatches(false);
-      setBatchMessage({ type: "info", text: `Batch check stopped for ${bId}` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchCheckStopped", { id: bId }),
+      });
     } catch (err) {
-      setBatchMessage({ type: "error", text: "Failed to stop batch check" });
+      setBatchMessage({
+        type: "error",
+        text: t("elRajhiUpload.batchCheckStopFailed"),
+      });
     }
   };
 
@@ -1373,9 +1544,15 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     try {
       await window.electronAPI.pauseElrajiBatch(bId);
       setIsPausedBatchRetry(true);
-      setBatchMessage({ type: "info", text: `Batch retry paused for ${bId}` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchRetryPaused", { id: bId }),
+      });
     } catch (err) {
-      setBatchMessage({ type: "error", text: "Failed to pause batch retry" });
+      setBatchMessage({
+        type: "error",
+        text: t("elRajhiUpload.batchRetryPauseFailed"),
+      });
     }
   };
 
@@ -1385,9 +1562,15 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     try {
       await window.electronAPI.resumeElrajiBatch(bId);
       setIsPausedBatchRetry(false);
-      setBatchMessage({ type: "info", text: `Batch retry resumed for ${bId}` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchRetryResumed", { id: bId }),
+      });
     } catch (err) {
-      setBatchMessage({ type: "error", text: "Failed to resume batch retry" });
+      setBatchMessage({
+        type: "error",
+        text: t("elRajhiUpload.batchRetryResumeFailed"),
+      });
     }
   };
 
@@ -1398,18 +1581,21 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       await window.electronAPI.stopElrajiBatch(bId);
       setIsPausedBatchRetry(false);
       setCheckingBatchId(null);
-      setBatchMessage({ type: "info", text: `Batch retry stopped for ${bId}` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchRetryStopped", { id: bId }),
+      });
     } catch (err) {
-      setBatchMessage({ type: "error", text: "Failed to stop batch retry" });
+      setBatchMessage({
+        type: "error",
+        text: t("elRajhiUpload.batchRetryStopFailed"),
+      });
     }
   };
 
   const uploadExcelOnly = async () => {
     throw new Error("uploadExcelOnly is deprecated in this flow.");
   };
-
-  const { token, isGuest } = useSession();
-
 
   const handleSubmitElrajhi = async () => {
     await executeWithAuth(
@@ -1420,11 +1606,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             throw new Error("Select an Excel file before sending.");
           }
 
-          if (!elrajhiCompanyContext) {
-            throw new Error(
-              "Select a company (office) in the app before sending reports to Taqeem.",
-            );
-          }
+          await ensureElrajhiActionReady();
 
           if (validationReportIssues.length) {
             throw new Error(
@@ -1532,38 +1714,17 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           );
 
           if (electronResult?.status === "SUCCESS") {
-            const resultMap = (electronResult.results || []).reduce(
-              (acc, res) => {
-                const key = res.record_id || res.recordId;
-                const reportId = res.report_id || res.reportId;
-                if (key && reportId) acc[key] = reportId;
-                return acc;
-              },
-              {},
+            applyElrajhiActionResultToValidationReports(
+              electronResult,
+              sendToConfirmerValidation,
             );
 
-            if (
-              Object.keys(resultMap).length ||
-              (electronResult.results || []).length
-            ) {
-              setValidationReports((prev) =>
-                prev.map((r, idx) => {
-                  const key = r.record_id || r.recordId || r._id;
-                  const fallback =
-                    (electronResult.results || [])[idx]?.report_id ||
-                    (electronResult.results || [])[idx]?.reportId;
-                  const reportId = resultMap[key] || r.report_id || fallback;
-                  return { ...r, report_id: reportId };
-                }),
-              );
-            }
+            await refreshElrajhiBatchState(batchIdFromData);
 
             setValidationMessage({
               type: "success",
-              text: `Upload succeeded. ${insertedCount} assets saved and sent to Taqeem browser.`,
+              text: `Upload succeeded. ${insertedCount} assets saved, statuses updated, and the action browser was closed.`,
             });
-
-            await loadBatchList();
           } else {
             throw new Error(
               electronResult?.error ||
@@ -1574,7 +1735,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           console.error("Upload failed", err);
           setValidationMessage({
             type: "error",
-            text: err.message || "Failed to upload reports",
+            text: getApiErrorMessage(err, "Failed to upload reports"),
           });
           throw err;
         } finally {
@@ -1591,6 +1752,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         sendToConfirmerValidation,
       },
       {
+        skipAuth: false,
         requiredPoints: validationReports.length || 0,
         skipNavigateToCompany: true,
         showInsufficientPointsModal: () => setShowInsufficientPointsModal(true),
@@ -1624,140 +1786,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         },
       },
     );
-  };
-
-  const handleSubmitPdfOnly = async () => {
-    try {
-      if (!validationExcelFile) {
-        throw new Error("Select an Excel file before sending.");
-      }
-
-      if (!elrajhiCompanyContext) {
-        throw new Error(
-          "Select a company (office) in the app before sending reports to Taqeem.",
-        );
-      }
-
-      if (validationReportIssues.length) {
-        throw new Error(
-          "Resolve the report info validation issues before sending.",
-        );
-      }
-      setPdfOnlySending(true);
-      setIsPausedPdfOnly(false);
-      setValidationMessage({
-        type: "info",
-        text: "Saving PDF reports to database...",
-      });
-      let pdfPathMap = {};
-      if (wantsPdfUpload && validationPdfFiles.length > 0) {
-        pdfPathMap = await getAbsolutePaths(validationPdfFiles, false);
-      } else {
-        pdfPathMap = await getAbsolutePaths([], true, [validationExcelFile]);
-      }
-
-      // Upload to backend
-      const data = await uploadElrajhiBatch(
-        validationExcelFile,
-        wantsPdfUpload ? validationPdfFiles : [],
-        null,
-        selectedCompanyOfficeId || null,
-        pdfPathMap, // ← new argument
-      );
-
-      console.log("ELRAJHI BATCH (PDF Only):", data);
-
-      const batchIdFromData = data.batchId;
-      setCurrentOperationBatchId(batchIdFromData);
-      const insertedCount = data.inserted || 0;
-      const reportsFromApi = Array.isArray(data.reports) ? data.reports : [];
-      if (reportsFromApi.length) {
-        setValidationReports((prev) => {
-          const byAsset = new Map();
-          reportsFromApi.forEach((r) => {
-            const key = (r.asset_name || "").toLowerCase();
-            if (!byAsset.has(key)) byAsset.set(key, []);
-            byAsset.get(key).push(r);
-          });
-          return prev.map((r) => {
-            const list = byAsset.get((r.asset_name || "").toLowerCase()) || [];
-            const next = list.shift();
-            if (next) {
-              return {
-                ...r,
-                record_id: next._id || next.id || next.record_id,
-                report_id: next.report_id || r.report_id,
-                batchId: batchIdFromData,
-              };
-            }
-            return r;
-          });
-        });
-      }
-      setValidationDownloadPath(`/elrajhi-upload/export/${batchIdFromData}`);
-
-      const pdfReports = validationReports.filter((report) => report.pdf_name);
-      const pdfCount = pdfReports.length;
-
-      setValidationMessage({
-        type: "success",
-        text: `PDF reports saved (${pdfCount} assets with PDFs). ${sendToConfirmerValidation ? "Sending to Taqeem..." : "Final submission skipped."}`,
-      });
-
-      const electronResult = await window.electronAPI.elrajhiUploadReport(
-        batchIdFromData,
-        recommendedTabs,
-        true,
-        sendToConfirmerValidation,
-        elrajhiCompanyContext,
-      );
-
-      if (electronResult?.status === "SUCCESS") {
-        const resultMap = (electronResult.results || []).reduce((acc, res) => {
-          const key = res.record_id || res.recordId;
-          const reportId = res.report_id || res.reportId;
-          if (key && reportId) acc[key] = reportId;
-          return acc;
-        }, {});
-
-        if (
-          Object.keys(resultMap).length ||
-          (electronResult.results || []).length
-        ) {
-          setValidationReports((prev) =>
-            prev.map((r, idx) => {
-              const key = r.record_id || r.recordId || r._id;
-              const fallback =
-                (electronResult.results || [])[idx]?.report_id ||
-                (electronResult.results || [])[idx]?.reportId;
-              const reportId = resultMap[key] || r.report_id || fallback;
-              return { ...r, report_id: reportId };
-            }),
-          );
-        }
-
-        setValidationMessage({
-          type: "success",
-          text: `PDF-only upload succeeded. ${pdfCount} assets with PDFs sent to Taqeem browser.`,
-        });
-      } else {
-        setValidationMessage({
-          type: "error",
-          text:
-            electronResult?.error ||
-            "PDF-only upload to Taqeem failed. Make sure you selected a company.",
-        });
-      }
-    } catch (err) {
-      console.error("PDF-only upload failed", err);
-      setValidationMessage({
-        type: "error",
-        text: err.message || "Failed to upload PDF reports",
-      });
-    } finally {
-      setPdfOnlySending(false);
-      setCurrentOperationBatchId(null);
-    }
   };
 
   const loadBatchList = async () => {
@@ -1803,6 +1831,13 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     }
   };
 
+  const refreshElrajhiBatchState = async (targetBatchId) => {
+    await loadBatchList();
+    if (targetBatchId) {
+      await loadBatchReports(targetBatchId);
+    }
+  };
+
   const ensureBatchReportsLoaded = async (batchId) => {
     if (!batchId) return [];
     if (batchReports[batchId]?.length) return batchReports[batchId];
@@ -1826,6 +1861,65 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       }))
       .filter((report) => report.reportId);
 
+  const buildTaqeemReportIds = (reports = []) => {
+    const seen = new Set();
+    return reports
+      .map((report) => report?.report_id || report?.reportId || "")
+      .map((reportId) => String(reportId || "").trim())
+      .filter((reportId) => {
+        if (!reportId || seen.has(reportId)) return false;
+        seen.add(reportId);
+        return true;
+      });
+  };
+
+  const getSuccessfulActionStatus = (electronResult, finalSubmitRequested) => {
+    if (!finalSubmitRequested) return "COMPLETE";
+    return Number(electronResult?.finalization_failed || 0) > 0
+      ? "COMPLETE"
+      : "SENT";
+  };
+
+  const applyElrajhiActionResultToValidationReports = (
+    electronResult,
+    finalSubmitRequested,
+  ) => {
+    const resultMap = (electronResult?.results || []).reduce((acc, res) => {
+      const key = res.record_id || res.recordId;
+      const reportId = res.report_id || res.reportId;
+      if (key && reportId) acc[key] = reportId;
+      return acc;
+    }, {});
+
+    if (!Object.keys(resultMap).length && !(electronResult?.results || []).length) {
+      return;
+    }
+
+    const nextStatus = getSuccessfulActionStatus(
+      electronResult,
+      finalSubmitRequested,
+    );
+
+    setValidationReports((prev) =>
+      prev.map((r, idx) => {
+        const key = r.record_id || r.recordId || r._id;
+        const fallback =
+          (electronResult.results || [])[idx]?.report_id ||
+          (electronResult.results || [])[idx]?.reportId;
+        const reportId = resultMap[key] || r.report_id || fallback;
+        if (!reportId) return r;
+        return {
+          ...r,
+          report_id: reportId,
+          report_status: nextStatus,
+          reportStatus: nextStatus,
+          status: nextStatus,
+          submit_state: 1,
+        };
+      }),
+    );
+  };
+
   const applyCertificateResults = (results = []) => {
     setCertificateStatusByReport((prev) => {
       const next = { ...prev };
@@ -1838,59 +1932,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     });
   };
 
-  const waitForTaqeemLogin = async (timeoutMs = 180000, intervalMs = 2000) => {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      if (!window?.electronAPI?.checkStatus) return true;
-      const status = await window.electronAPI.checkStatus();
-      const ok =
-        status?.browserOpen &&
-        String(status?.status || "")
-          .toUpperCase()
-          .includes("SUCCESS");
-      if (ok) return true;
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    }
-    throw new Error("Timed out waiting for Taqeem login.");
-  };
-
-  const ensureTaqeemAutomationReady = async () => {
-    if (!window?.electronAPI?.checkStatus) return true;
-
-    let status = null;
-    try {
-      status = await window.electronAPI.checkStatus();
-    } catch (err) {
-      status = null;
-    }
-
-    const statusCode = String(status?.status || "").toUpperCase();
-    const isLoggedIn = status?.browserOpen && statusCode.includes("SUCCESS");
-    if (isLoggedIn) return true;
-
-    if (!window?.electronAPI?.openTaqeemLogin) {
-      throw new Error("Taqeem login handler unavailable.");
-    }
-
-    setBatchMessage({
-      type: "info",
-      text: "Taqeem login required. Opening login window...",
-    });
-
-    const loginResult = await window.electronAPI.openTaqeemLogin({
-      automationOnly: true,
-      onlyIfClosed: false,
-      navigateIfOpen: true,
-    });
-
-    if (loginResult?.status !== "SUCCESS") {
-      throw new Error(loginResult?.error || "Failed to open Taqeem login.");
-    }
-
-    await waitForTaqeemLogin();
-    return true;
-  };
-
   const attachPdfToReport = async (batchId, report, file) => {
     if (!file) return;
     const targetId =
@@ -1899,7 +1940,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     if (!targetId) {
       setBatchMessage({
         type: "error",
-        text: "Unable to attach PDF: report identifier is missing.",
+        text: t("elRajhiUpload.attachPdfMissingId"),
       });
       return;
     }
@@ -1907,7 +1948,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     setPdfUploadBusy((prev) => ({ ...prev, [targetId]: true }));
     setBatchMessage({
       type: "info",
-      text: "Uploading PDF...",
+      text: t("elRajhiUpload.uploadingPdf"),
     });
 
     try {
@@ -1920,13 +1961,15 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       setPdfUploadedThisSession((prev) => ({ ...prev, [reportKey]: true }));
       setBatchMessage({
         type: "success",
-        text: "PDF attached. You can proceed with actions.",
+        text: t("elRajhiUpload.pdfAttachedSuccess"),
       });
     } catch (err) {
       setBatchMessage({
         type: "error",
         text:
-          err?.response?.data?.error || err.message || "Failed to attach PDF.",
+          err?.response?.data?.error ||
+          err.message ||
+          t("elRajhiUpload.attachPdfFailed"),
       });
     } finally {
       setPdfUploadBusy((prev) => {
@@ -1942,11 +1985,14 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     try {
       await window.electronAPI.pauseElrajiBatch(batchId);
       setBatchPaused((prev) => ({ ...prev, [batchId]: true }));
-      setBatchMessage({ type: "info", text: `Batch ${batchId} paused.` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchPausedMsg", { id: batchId }),
+      });
     } catch (err) {
       setBatchMessage({
         type: "error",
-        text: err?.message || "Failed to pause batch.",
+        text: err?.message || t("elRajhiUpload.batchPausedFailed"),
       });
     }
   };
@@ -1956,20 +2002,21 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     try {
       await window.electronAPI.resumeElrajiBatch(batchId);
       setBatchPaused((prev) => ({ ...prev, [batchId]: false }));
-      setBatchMessage({ type: "info", text: `Batch ${batchId} resumed.` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchResumedMsg", { id: batchId }),
+      });
     } catch (err) {
       setBatchMessage({
         type: "error",
-        text: err?.message || "Failed to resume batch.",
+        text: err?.message || t("elRajhiUpload.batchResumeFailed"),
       });
     }
   };
 
   const stopBatchActions = async (batchId) => {
     if (!batchId || !window?.electronAPI?.stopElrajiBatch) return;
-    const confirmed = window.confirm(
-      "Stop will terminate the current action and close the browser. Continue?",
-    );
+    const confirmed = window.confirm(t("elRajhiUpload.confirmStopBatch"));
     if (!confirmed) return;
     try {
       await window.electronAPI.stopElrajiBatch(batchId);
@@ -1978,11 +2025,14 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         current === batchId ? null : current,
       );
       setBatchPaused((prev) => ({ ...prev, [batchId]: false }));
-      setBatchMessage({ type: "info", text: `Batch ${batchId} stopped.` });
+      setBatchMessage({
+        type: "info",
+        text: t("elRajhiUpload.batchStoppedMsg", { id: batchId }),
+      });
     } catch (err) {
       setBatchMessage({
         type: "error",
-        text: err?.message || "Failed to stop batch.",
+        text: err?.message || t("elRajhiUpload.batchStopFailed"),
       });
     }
   };
@@ -2005,15 +2055,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       return;
     }
 
-    try {
-      await ensureTaqeemAutomationReady();
-    } catch (err) {
-      setBatchMessage({
-        type: "error",
-        text: err?.message || "Please login to Taqeem in the opened browser.",
-      });
-      return;
-    }
+    await ensureElrajhiActionReady();
 
     const folderResult = await window.electronAPI.selectFolder();
     if (!folderResult?.folderPath) {
@@ -2052,7 +2094,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
       setBatchMessage({
         type: failed > 0 ? "info" : "success",
-        text: `Certificates downloaded: ${downloaded}. Skipped: ${skipped}. Failed: ${failed}.`,
+        text: `Certificates downloaded: ${downloaded}. Skipped: ${skipped}. Failed: ${failed}. The action browser was closed.`,
       });
     } catch (err) {
       setBatchMessage({
@@ -2178,6 +2220,8 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       async (params) => {
         const { token: authToken } = params;
 
+        await ensureElrajhiActionReady();
+
         if (!window?.electronAPI?.checkElrajhiBatches) {
           throw new Error("Desktop integration unavailable. Restart the app.");
         }
@@ -2191,8 +2235,8 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         setBatchMessage({
           type: "info",
           text: batchId
-            ? `Checking batch ${batchId}...`
-            : "Checking all batches...",
+            ? t("elRajhiUpload.checkingBatchProgress", { id: batchId })
+            : t("elRajhiUpload.checkingAllBatchesProgress"),
         });
 
         try {
@@ -2204,13 +2248,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             throw new Error(result?.error || "Check failed");
           }
 
-          setBatchMessage({
-            type: "success",
-            text: batchId
-              ? `Check finished for ${batchId}`
-              : "Completed check for all batches",
-          });
-
           await loadBatchList();
           if (batchId) {
             await loadBatchReports(batchId);
@@ -2218,10 +2255,17 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             await loadBatchReports(expandedBatch);
           }
           applyBatchCheckResults(result?.batches);
+
+          setBatchMessage({
+            type: "success",
+            text: batchId
+              ? t("elRajhiUpload.checkFinishedBatch", { id: batchId })
+              : t("elRajhiUpload.checkAllBatchesComplete"),
+          });
         } catch (err) {
           setBatchMessage({
             type: "error",
-            text: err.message || "Failed to check reports",
+            text: err.message || t("elRajhiUpload.checkReportsFailed"),
           });
           throw err;
         } finally {
@@ -2232,6 +2276,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       },
       { token },
       {
+        skipAuth: false,
         requiredPoints: 0, // Check doesn't cost points
         skipNavigateToCompany: true,
         showInsufficientPointsModal: () => setShowInsufficientPointsModal(true),
@@ -2244,7 +2289,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           if (reason !== "INSUFFICIENT_POINTS" && reason !== "LOGIN_REQUIRED") {
             setBatchMessage({
               type: "error",
-              text: reason?.message || "Authentication failed for batch check",
+              text: reason?.message || t("elRajhiUpload.authFailedBatchCheck"),
             });
           }
         },
@@ -2534,13 +2579,55 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             text: `Found ${invalidTotals.length} asset(s) with invalid totals. Example: Asset "${firstInvalid.assetName}" (row ${firstInvalid.rowNumber}) totals ${firstInvalid.total}%. Must be 100%.`,
           });
         } else {
-          const valuerNote = hasAnyValuerData
+          const totalRows = reports.length;
+          const nameSep = i18n.language?.startsWith("ar") ? "، " : ", ";
+
+          const reportInfoOkPhrase = hasAnyValuerData
             ? ""
-            : " No valuer data found in Excel.";
-          setValidationMessage({
-            type: "success",
-            text: `Loaded ${assets.length} asset(s). Matched ${matchedCount} PDF(s) by asset name.${valuerNote} Report info looks valid.`,
-          });
+            : ` ${t("elRajhiUpload.pdfMatchNoValuerNoteShort")}`;
+
+          if (pdfList.length > 0) {
+            if (matchedCount === totalRows) {
+              setValidationMessage({
+                type: "success",
+                text:
+                  `${t("elRajhiUpload.pdfMatchManualAllSuccess", {
+                    total: totalRows,
+                    matched: matchedCount,
+                  })}${reportInfoOkPhrase}`,
+              });
+            } else {
+              const { listPart, overflow } = summarizeUnmatchedPdfAssets(
+                reports,
+                { separator: nameSep },
+              );
+              const overflowSuffix =
+                overflow > 0
+                  ? t("elRajhiUpload.pdfMatchListOverflowSuffix", {
+                      count: overflow,
+                    })
+                  : "";
+              setValidationMessage({
+                type: "warning",
+                text:
+                  `${t("elRajhiUpload.pdfMatchManualPartialWarning", {
+                    matched: matchedCount,
+                    total: totalRows,
+                    names:
+                      listPart ||
+                      t("elRajhiUpload.pdfMatchNoNamesFallback"),
+                  })}${overflowSuffix}${reportInfoOkPhrase}`,
+              });
+            }
+          } else {
+            setValidationMessage({
+              type: "success",
+              text:
+                `${t("elRajhiUpload.pdfMatchAutoAllSuccess", {
+                  total: totalRows,
+                })}${reportInfoOkPhrase}`,
+            });
+          }
         }
       }
 
@@ -2579,14 +2666,11 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           if (!excelFile) {
             throw new Error("Please select an Excel file before sending.");
           }
+
+          await ensureElrajhiActionReady();
+
           if (!pdfFiles.length) {
             throw new Error("Please select PDF files before sending.");
-          }
-
-          if (!elrajhiCompanyContext) {
-            throw new Error(
-              "Select a company (office) in the app before sending reports to Taqeem.",
-            );
           }
 
           const mainValidation = await runReportValidationForFile(
@@ -2616,15 +2700,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           Object.entries(pdfPathMap).forEach(([key, value]) => {
             formData.append(key, value);
           });
-          const response = await axios.post(
-            "http://167.71.231.64:3000/api/upload",
-            formData,
-            {
-              headers: {
-                "Content-Type": "multipart/form-data",
-              },
-            },
-          );
+          const response = await httpClient.post("/upload", formData);
 
           const payloadFromApi = response.data;
 
@@ -2635,6 +2711,12 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           }
 
           const insertedCount = payloadFromApi.inserted || 0;
+          if (insertedCount > 0) {
+            recordUploadBatch(selectedCompanyOfficeId, "elrajhi", {
+              inserted: insertedCount,
+              nameHint: selectedCompany?.name,
+            });
+          }
           const docs = payloadFromApi.data || [];
           const batchIdFromApi = payloadFromApi.batchId || "urgent-upload";
 
@@ -2665,6 +2747,10 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           );
 
           if (electronResult?.status === "SUCCESS") {
+            const nextStatus = getSuccessfulActionStatus(
+              electronResult,
+              sendToConfirmerMain,
+            );
             const resultMap = (electronResult.results || []).reduce(
               (acc, res) => {
                 const key = res.record_id || res.recordId;
@@ -2690,14 +2776,24 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                     (electronResult.results || [])[idx]?.reportId;
                   const reportId =
                     resultMap[key] || r.report_id || fallbackFromOrder;
-                  return { ...r, report_id: reportId };
+                  if (!reportId) return r;
+                  return {
+                    ...r,
+                    report_id: reportId,
+                    report_status: nextStatus,
+                    reportStatus: nextStatus,
+                    status: nextStatus,
+                    submit_state: 1,
+                  };
                 });
                 return { ...prev, reports };
               });
             }
 
+            await refreshElrajhiBatchState(batchIdFromApi);
+
             setSuccess(
-              `Upload succeeded. ${insertedCount} assets saved and dispatched to Taqeem tabs${sendToConfirmerMain ? "" : " (final submit skipped)"}.`,
+              `Upload succeeded. ${insertedCount} assets saved, statuses updated, and the action browser was closed${sendToConfirmerMain ? "" : " (final submit skipped)"}.`,
             );
           } else {
             const errMsg =
@@ -2719,6 +2815,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       },
       { token, excelFile, pdfFiles, sendToConfirmerMain },
       {
+        skipAuth: false,
         requiredPoints: pdfFiles.length || 0,
         skipNavigateToCompany: true,
         showInsufficientPointsModal: () => setShowInsufficientPointsModal(true),
@@ -2807,11 +2904,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
   const pdfReportCount = validationReports.filter(
     (report) => report.pdf_name,
   ).length;
-  const canSendPdfOnly =
-    canSendReports &&
-    Boolean(elrajhiCompanyContext) &&
-    wantsPdfUpload &&
-    pdfReportCount > 0;
 
   const resetValidationSection = () => {
     resetValidationFlow();
@@ -2819,7 +2911,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     setValidationPdfFiles([]);
     setSendToConfirmerValidation(false);
     setIsPausedValidation(false);
-    setIsPausedPdfOnly(false);
     setWantsPdfUpload(false);
     resetValidationCardState();
     resetValidationBanner();
@@ -2864,12 +2955,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
       if (!parseResult) return;
 
-      const {
-        assets,
-        matchedCount,
-        reportIssues = [],
-        reportSnapshot = null,
-      } = parseResult;
+      const { assets, reportIssues = [], reportSnapshot = null } = parseResult;
 
       setValidationReportIssues(reportIssues);
       setValidationReportSnapshot(reportSnapshot);
@@ -2881,39 +2967,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         });
         return;
       }
-
-      if (reportIssues.length) {
-        setValidationMessage({
-          type: "error",
-          text: `Found ${reportIssues.length} validation issue(s). Review the details below before sending.`,
-        });
-        return;
-      }
-
-      const hasInvalidTotals = assets.some(
-        (asset) =>
-          asset.hasValuerData &&
-          Math.abs((asset.totalPercentage || 0) - 100) > 0.001,
-      );
-
-      if (hasInvalidTotals) {
-        setValidationMessage({
-          type: "error",
-          text: "Valuer percentages must total 100% for every asset with valuer data before saving.",
-        });
-        return;
-      }
-
-      const pdfCount = wantsPdfUpload ? validationPdfFiles.length : 0;
-      const valuerNote = assets.some((asset) => asset.hasValuerData)
-        ? ""
-        : " No valuer data found in Excel.";
-      const pdfNote = wantsPdfUpload ? ` and ${pdfCount} PDF(s)` : "";
-
-      setValidationMessage({
-        type: "success",
-        text: `Files staged. Found ${assets.length} asset(s)${pdfNote}. Matched ${matchedCount} PDF(s) by asset name.${valuerNote} Report info is valid.`,
-      });
     } finally {
       setSavingValidation(false);
       setShowValidationModal(true);
@@ -2944,62 +2997,70 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     onResume,
     onStop,
     disabled = false,
-  }) => (
-    <div className="flex gap-2">
-      {!isPaused && isRunning && (
-        <button
-          type="button"
-          onClick={onPause}
-          disabled={disabled}
-          className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-amber-600 text-white text-xs font-semibold hover:bg-amber-700 disabled:opacity-50"
-        >
-          <Pause className="w-4 h-4" />
-          Pause
-        </button>
-      )}
-      {isPaused && (
-        <button
-          type="button"
-          onClick={onResume}
-          disabled={disabled}
-          className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-green-600 text-white text-xs font-semibold hover:bg-green-700 disabled:opacity-50"
-        >
-          <Play className="w-4 h-4" />
-          Resume
-        </button>
-      )}
-      {isRunning && (
-        <button
-          type="button"
-          onClick={onStop}
-          disabled={disabled}
-          className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-red-600 text-white text-xs font-semibold hover:bg-red-700 disabled:opacity-50"
-        >
-          <Square className="w-4 h-4" />
-          Stop
-        </button>
-      )}
-    </div>
-  );
+    compact = false,
+  }) => {
+    const wrapGap = compact ? "gap-1" : "gap-2";
+    const btnBase = compact
+      ? "inline-flex h-9 shrink-0 items-center gap-1 rounded-lg px-2 text-[10px] font-semibold"
+      : "inline-flex items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold";
+    const iconCls = compact ? "h-3.5 w-3.5 shrink-0" : "h-4 w-4";
+    return (
+      <div className={`flex min-w-0 ${wrapGap}`}>
+        {!isPaused && isRunning && (
+          <button
+            type="button"
+            onClick={onPause}
+            disabled={disabled}
+            className={`${btnBase} bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50`}
+          >
+            <Pause className={iconCls} />
+            {t("elRajhiUpload.pause")}
+          </button>
+        )}
+        {isPaused && (
+          <button
+            type="button"
+            onClick={onResume}
+            disabled={disabled}
+            className={`${btnBase} bg-green-600 text-white hover:bg-green-700 disabled:opacity-50`}
+          >
+            <Play className={iconCls} />
+            {t("elRajhiUpload.resume")}
+          </button>
+        )}
+        {isRunning && (
+          <button
+            type="button"
+            onClick={onStop}
+            disabled={disabled}
+            className={`${btnBase} bg-red-600 text-white hover:bg-red-700 disabled:opacity-50`}
+          >
+            <Square className={iconCls} />
+            {t("elRajhiUpload.stop")}
+          </button>
+        )}
+      </div>
+    );
+  };
 
   const ValidationResultsCard = ({ title, issues = [], snapshot }) => {
     if (!snapshot && !issues.length) return null;
 
     const fields = [
-      { label: "Purpose of Valuation", value: snapshot?.purpose },
-      { label: "Value Attributes", value: snapshot?.valueAttributes },
-      { label: "Report", value: snapshot?.reportType },
-      { label: "Client Name", value: snapshot?.clientName },
-      { label: "Client Telephone", value: snapshot?.telephone },
-      { label: "Client Email", value: snapshot?.email },
+      { label: t("elRajhiUpload.fieldPurpose"), value: snapshot?.purpose },
+      { label: t("elRajhiUpload.fieldValueAttributes"), value: snapshot?.valueAttributes },
+      { label: t("elRajhiUpload.fieldReportType"), value: snapshot?.reportType },
+      { label: t("elRajhiUpload.fieldClientName"), value: snapshot?.clientName },
+      { label: t("elRajhiUpload.fieldClientPhone"), value: snapshot?.telephone },
+      { label: t("elRajhiUpload.fieldClientEmail"), value: snapshot?.email },
       {
-        label: "Date of Valuation",
+        label: t("elRajhiUpload.fieldValuationDate"),
         value: snapshot?.valuedAt
           ? formatDateForDisplay(snapshot.valuedAt)
           : "",
       },
       {
-        label: "Report Issuing Date",
+        label: t("elRajhiUpload.fieldReportDate"),
         value: snapshot?.submittedAt
           ? formatDateForDisplay(snapshot.submittedAt)
           : "",
@@ -3007,7 +3068,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     ];
 
     return (
-      <div className="bg-white border border-slate-200 rounded-lg shadow-sm">
+      <div className="rounded-lg border border-slate-200/90 bg-white shadow-sm">
         {showInsufficientPointsModal && (
           <div className="fixed inset-0 z-[9999]">
             <div className="absolute top-20 left-1/2 transform -translate-x-1/2 w-full max-w-sm">
@@ -3018,31 +3079,33 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             </div>
           </div>
         )}
-        <div className="px-4 py-3 border-b flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Table className="w-4 h-4 text-blue-600" />
-            <p className="text-sm font-semibold text-gray-900">{title}</p>
+        <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <Table className="w-4 h-4 shrink-0 text-emerald-700" />
+            <p className="text-sm font-semibold text-slate-800 truncate">{title}</p>
           </div>
           <span
-            className={`text-xs font-semibold px-2 py-1 rounded-full border ${
+            className={`shrink-0 text-[11px] font-semibold px-2 py-0.5 rounded-md border ${
               issues.length
-                ? "bg-red-50 text-red-700 border-red-100"
-                : "bg-emerald-50 text-emerald-700 border-emerald-100"
+                ? "bg-rose-50 text-rose-800 border-rose-100"
+                : "bg-emerald-50 text-emerald-800 border-emerald-100"
             }`}
           >
-            {issues.length ? `${issues.length} issue(s)` : "No issues found"}
+            {issues.length
+              ? t("elRajhiUpload.issuesCount", { count: issues.length })
+              : t("elRajhiUpload.noIssues")}
           </span>
         </div>
-        <div className="p-4 space-y-3">
+        <div className="p-3 space-y-2">
           {snapshot ? (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 text-xs">
               {fields.map((field) => (
                 <div
                   key={field.label}
                   className="p-2 rounded-md bg-slate-50 border border-slate-100"
                 >
-                  <p className="font-semibold text-gray-800">{field.label}</p>
-                  <p className="text-gray-700 break-words">
+                  <p className="font-semibold text-slate-700 text-[11px]">{field.label}</p>
+                  <p className="text-slate-800 break-words mt-0.5">
                     {field.value || "—"}
                   </p>
                 </div>
@@ -3051,28 +3114,28 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           ) : null}
 
           {issues.length ? (
-            <div className="overflow-x-auto">
-              <table className="min-w-full text-xs">
-                <thead className="bg-red-50 text-red-700">
+            <div className="overflow-x-auto rounded-md border border-slate-100">
+              <table className="min-w-full text-[11px]">
+                <thead className="bg-rose-50 text-rose-800">
                   <tr>
-                    <th className="px-3 py-2 text-left">Field</th>
-                    <th className="px-3 py-2 text-left">Location</th>
-                    <th className="px-3 py-2 text-left">Details</th>
+                    <th className="px-2 py-1.5 text-start">{t("elRajhiUpload.tableField")}</th>
+                    <th className="px-2 py-1.5 text-start">{t("elRajhiUpload.tableLocation")}</th>
+                    <th className="px-2 py-1.5 text-start">{t("elRajhiUpload.tableDetails")}</th>
                   </tr>
                 </thead>
                 <tbody>
                   {issues.map((issue, idx) => (
                     <tr
                       key={`${issue.field}-${idx}`}
-                      className="border-t bg-red-50"
+                      className="border-t border-slate-100 bg-white"
                     >
-                      <td className="px-3 py-2 font-semibold text-red-800">
+                      <td className="px-2 py-1.5 font-semibold text-rose-900">
                         {issue.field}
                       </td>
-                      <td className="px-3 py-2 text-red-700">
+                      <td className="px-2 py-1.5 text-rose-800">
                         {issue.location || "—"}
                       </td>
-                      <td className="px-3 py-2 text-red-700">
+                      <td className="px-2 py-1.5 text-rose-800">
                         {issue.message}
                       </td>
                     </tr>
@@ -3081,9 +3144,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
               </table>
             </div>
           ) : (
-            <div className="flex items-center gap-2 text-sm text-emerald-700">
-              <CheckCircle2 className="w-4 h-4" />
-              All required fields look good.
+            <div className="flex items-center gap-2 text-xs text-emerald-800">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              {t("elRajhiUpload.fieldsGood")}
             </div>
           )}
         </div>
@@ -3137,23 +3200,19 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     if (!selected.length) {
       setBatchMessage({
         type: "info",
-        text: "Select at least one report first.",
+        text: t("elRajhiUpload.selectOneFirst"),
       });
       return;
     }
 
     const readableAction =
       action === "retry-submit"
-        ? "Retry submit"
+        ? t("elRajhiUpload.bulkRetrySubmit")
         : action === "delete"
-          ? "Delete"
+          ? t("elRajhiUpload.bulkDelete")
           : action === "retry"
-            ? "Retry"
-            : action === "send"
-              ? "Finalize"
-              : action === "approve"
-                ? "Approve"
-                : "Download certificates";
+            ? t("elRajhiUpload.bulkRetryShort")
+            : t("elRajhiUpload.bulkDownloadCert");
 
     // Common function for actions that require authentication
     const executeAuthenticatedAction = async (
@@ -3161,38 +3220,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       actionName,
       requiredPoints = 1,
     ) => {
-      return await executeWithAuth(
-        async (params) => {
-          const { token: authToken } = params;
-          return await actionFunc(authToken);
-        },
-        { token },
-        {
-          requiredPoints: requiredPoints,
-          skipNavigateToCompany: true,
-          showInsufficientPointsModal: () =>
-            setShowInsufficientPointsModal(true),
-          onViewChange,
-          onAuthSuccess: () => {
-            console.log(`${actionName} authentication successful`);
-          },
-          onAuthFailure: (reason) => {
-            console.warn(`${actionName} authentication failed:`, reason);
-            if (
-              reason !== "INSUFFICIENT_POINTS" &&
-              reason !== "LOGIN_REQUIRED"
-            ) {
-              setBatchMessage({
-                type: "error",
-                text:
-                  reason?.message ||
-                  `Authentication failed for ${actionName.toLowerCase()}`,
-              });
-            }
-            throw reason;
-          },
-        },
-      );
+      return await actionFunc(token);
     };
 
     setBulkActionBusy(action);
@@ -3200,16 +3228,21 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     setBatchPaused((prev) => ({ ...prev, [batchId]: false }));
     setBatchMessage({
       type: "info",
-      text: `${readableAction} in progress for ${selected.length} report(s)...`,
+      text: t("elRajhiUpload.actionInProgress", {
+        action: readableAction,
+        count: selected.length,
+      }),
     });
 
     try {
+      await ensureElrajhiActionReady();
+
       if (action === "retry-submit") {
         await executeAuthenticatedAction(
           async (authToken) => {
             if (!window?.electronAPI?.createReportById) {
               throw new Error(
-                "Desktop integration unavailable. Restart the app.",
+                t("elRajhiUpload.desktopIntegrationUnavailable"),
               );
             }
 
@@ -3235,7 +3268,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
             if (!window?.electronAPI?.retryElrajhiReportRecordIds) {
               throw new Error(
-                "Desktop integration unavailable. Restart the app.",
+                t("elRajhiUpload.desktopIntegrationUnavailable"),
               );
             }
 
@@ -3258,7 +3291,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
         setBatchMessage({
           type: "success",
-          text: `Retry submit completed for ${selected.length} report(s).`,
+          text: t("elRajhiUpload.msgBulkRetrySubmitSuccess", {
+            count: selected.length,
+          }),
         });
       } else if (action === "delete") {
         // Extract report IDs for the selected reports
@@ -3285,7 +3320,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
         setBatchMessage({
           type: "success",
-          text: `Deleted ${reportIds.length} report(s) successfully`,
+          text: t("elRajhiUpload.msgBulkDeleteSuccess", {
+            count: reportIds.length,
+          }),
         });
       } else if (action === "retry") {
         await executeAuthenticatedAction(
@@ -3319,56 +3356,12 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
         setBatchMessage({
           type: "success",
-          text: `Retry completed for ${selected.length} report(s)`,
+          text: t("elRajhiUpload.msgBulkRetrySuccess", {
+            count: selected.length,
+          }),
         });
-      } else if (action === "send") {
-        await executeAuthenticatedAction(
-          async (authToken) => {
-            const reportIds = selected
-              .map((report) => report.report_id || report.reportId)
-              .filter((id) => id && String(id).trim() !== "");
-
-            if (reportIds.length === 0) {
-              throw new Error("No valid report IDs found in selected reports");
-            }
-
-            // Use the new finalizeMultipleReports function
-            const result =
-              await window.electronAPI.finalizeMultipleReports(reportIds);
-            if (result?.status !== "SUCCESS") {
-              throw new Error(
-                result?.error || "Finalize multiple reports failed",
-              );
-            }
-
-            // Refresh data
-            await loadBatchReports(batchId);
-            await loadBatchList();
-
-            return `Finalized ${reportIds.length} report(s) successfully`;
-          },
-          "Finalize",
-          selected.length,
-        );
-
-        setBatchMessage({
-          type: "success",
-          text: `Finalized ${selected.length} report(s) successfully`,
-        });
-      } else if (action === "approve") {
-        // Approve requires authentication
-        await executeAuthenticatedAction(
-          async (authToken) => {
-            // Implement approve logic here
-            throw new Error(
-              "Approve via single-report automation is not wired to desktop integration yet.",
-            );
-          },
-          "Approve",
-          selected.length,
-        );
       } else if (action === "certificate") {
-        // Certificate download doesn't require authentication, but we'll wrap it anyway
+        // Certificate download uses the primary Taqeem browser session, not the secondary approval login.
         const reportIds = selected
           .map((report) => report.report_id || report.reportId)
           .filter((id) => id && String(id).trim() !== "");
@@ -3392,7 +3385,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           type: "error",
           text:
             err?.message ||
-            `Failed to ${readableAction.toLowerCase()} selected report(s).`,
+            t("elRajhiUpload.bulkActionFailedGeneric", {
+              action: readableAction,
+            }),
         });
       }
     } finally {
@@ -3422,30 +3417,53 @@ const UploadReportElrajhi = ({ onViewChange }) => {
   );
 
   const reportInfoFields = [
-    { label: "Purpose of Valuation", value: validationReportSnapshot?.purpose },
     {
-      label: "Value Attributes",
+      issueField: "Purpose of Valuation",
+      label: t("elRajhiUpload.fieldPurpose"),
+      value: validationReportSnapshot?.purpose,
+    },
+    {
+      issueField: "Value Attributes",
+      label: t("elRajhiUpload.fieldValueAttributes"),
       value: validationReportSnapshot?.valueAttributes,
     },
-    { label: "Report", value: validationReportSnapshot?.reportType },
-    { label: "Client Name", value: validationReportSnapshot?.clientName },
-    { label: "Client Telephone", value: validationReportSnapshot?.telephone },
-    { label: "Client Email", value: validationReportSnapshot?.email },
     {
-      label: "Date of Valuation",
+      issueField: "Report",
+      label: t("elRajhiUpload.fieldReportType"),
+      value: validationReportSnapshot?.reportType,
+    },
+    {
+      issueField: "Client Name",
+      label: t("elRajhiUpload.fieldClientName"),
+      value: validationReportSnapshot?.clientName,
+    },
+    {
+      issueField: "Client Telephone",
+      label: t("elRajhiUpload.fieldClientPhone"),
+      value: validationReportSnapshot?.telephone,
+    },
+    {
+      issueField: "Client Email",
+      label: t("elRajhiUpload.fieldClientEmail"),
+      value: validationReportSnapshot?.email,
+    },
+    {
+      issueField: "Date of Valuation",
+      label: t("elRajhiUpload.fieldValuationDate"),
       value: validationReportSnapshot?.valuedAt
         ? formatDateForDisplay(validationReportSnapshot.valuedAt)
         : "",
     },
     {
-      label: "Report Issuing Date",
+      issueField: "Report Issuing Date",
+      label: t("elRajhiUpload.fieldReportDate"),
       value: validationReportSnapshot?.submittedAt
         ? formatDateForDisplay(validationReportSnapshot.submittedAt)
         : "",
     },
   ];
 
-  const reportInfoFieldLabels = reportInfoFields.map((field) => field.label);
+  const reportInfoFieldIssueKeys = reportInfoFields.map((f) => f.issueField);
   const reportInfoIssuesByField = validationReportIssues.reduce(
     (acc, issue) => {
       const key = issue.field || "General";
@@ -3456,28 +3474,34 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     {},
   );
   const extraReportInfoIssues = validationReportIssues.filter(
-    (issue) => !reportInfoFieldLabels.includes(issue.field),
+    (issue) =>
+      !issue.field || !reportInfoFieldIssueKeys.includes(issue.field),
   );
   const hasReportInfoData =
     Boolean(validationReportSnapshot) || validationReportIssues.length > 0;
 
   const getValidationSummary = () => {
     if (!validationExcelFile) {
-      return { type: "info", text: "Upload Excel file to validate." };
+      return { type: "info", text: t("elRajhiUpload.uploadExcelToValidate") };
     }
     if (validationReportIssues.length) {
       return {
         type: "error",
-        text: `Excel has ${validationReportIssues.length} issue(s). Fix them before upload.`,
+        text: t("elRajhiUpload.excelIssuesSummary", {
+          count: validationReportIssues.length,
+        }),
       };
     }
     if (validationMessage?.type === "error") {
       return { type: "error", text: validationMessage.text };
     }
+    if (validationMessage?.type === "warning") {
+      return { type: "warning", text: validationMessage.text };
+    }
     if (validationMessage?.type === "success") {
       return { type: "success", text: validationMessage.text };
     }
-    return { type: "success", text: "Excel validated. No issues found." };
+    return { type: "success", text: t("elRajhiUpload.excelValidatedOk") };
   };
 
   const validationSummary = getValidationSummary();
@@ -3485,19 +3509,23 @@ const UploadReportElrajhi = ({ onViewChange }) => {
   const validationSummarySection = (
     <div className="rounded-xl border border-blue-900/10 bg-white p-3 shadow-sm">
       <div className="text-[11px] font-semibold text-blue-900 mb-1">
-        Validation on Excel
+        {t("elRajhiUpload.validationOnExcel")}
       </div>
       <div
         className={`rounded-lg border px-3 py-2 inline-flex items-start gap-2 text-[11px] ${
           validationSummary.type === "error"
             ? "bg-rose-50 text-rose-700 border-rose-100"
-            : validationSummary.type === "success"
-              ? "bg-emerald-50 text-emerald-700 border-emerald-100"
-              : "bg-blue-50 text-blue-700 border-blue-100"
+            : validationSummary.type === "warning"
+              ? "bg-amber-50 text-amber-900 border-amber-200"
+              : validationSummary.type === "success"
+                ? "bg-emerald-50 text-emerald-700 border-emerald-100"
+                : "bg-blue-50 text-blue-700 border-blue-100"
         }`}
       >
         {validationSummary.type === "error" ? (
           <AlertTriangle className="w-4 h-4 mt-0.5" />
+        ) : validationSummary.type === "warning" ? (
+          <AlertTriangle className="w-4 h-4 mt-0.5 text-amber-600" />
         ) : validationSummary.type === "success" ? (
           <CheckCircle2 className="w-4 h-4 mt-0.5" />
         ) : (
@@ -3513,7 +3541,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
       <div className="bg-gradient-to-r from-blue-900 via-slate-900 to-blue-900 px-2 py-2 text-white">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="space-y-1">
-            <p className="text-[11px] font-semibold">Validation console</p>
+            <p className="text-[11px] font-semibold">
+              {t("elRajhiUpload.validationConsole")}
+            </p>
           </div>
           {validationDownloadPath && (
             <button
@@ -3534,8 +3564,8 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                 <Download className="w-4 h-4" />
               )}
               {downloadingValidationExcel
-                ? "Preparing..."
-                : "Download updated Excel"}
+                ? t("elRajhiUpload.preparingShort")
+                : t("elRajhiUpload.downloadUpdatedExcelBtn")}
             </button>
           )}
         </div>
@@ -3550,7 +3580,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                   : "text-blue-100 hover:text-white"
               }`}
             >
-              Report Info validation
+              {t("elRajhiUpload.tabReportInfo")}
             </button>
             <button
               type="button"
@@ -3561,7 +3591,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                   : "text-blue-100 hover:text-white"
               }`}
             >
-              Validate PDFs & assets data
+              {t("elRajhiUpload.tabPdfAssets")}
             </button>
           </div>
           <button
@@ -3574,7 +3604,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             ) : (
               <ChevronUp className="w-3 h-3" />
             )}
-            {isValidationTableCollapsed ? "Show table" : "Hide table"}
+            {isValidationTableCollapsed
+              ? t("elRajhiUpload.showTable")
+              : t("elRajhiUpload.hideTable")}
           </button>
         </div>
       </div>
@@ -3584,13 +3616,17 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             className={`rounded-lg border px-2 py-1 inline-flex items-start gap-1 text-[10px] ${
               validationMessage.type === "error"
                 ? "bg-rose-50 text-rose-700 border-rose-100"
-                : validationMessage.type === "success"
-                  ? "bg-emerald-50 text-emerald-700 border-emerald-100"
-                  : "bg-blue-50 text-blue-700 border-blue-100"
+                : validationMessage.type === "warning"
+                  ? "bg-amber-50 text-amber-900 border-amber-200"
+                  : validationMessage.type === "success"
+                    ? "bg-emerald-50 text-emerald-700 border-emerald-100"
+                    : "bg-blue-50 text-blue-700 border-blue-100"
             }`}
           >
             {validationMessage.type === "error" ? (
               <AlertTriangle className="w-4 h-4 mt-0.5" />
+            ) : validationMessage.type === "warning" ? (
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-amber-600" />
             ) : validationMessage.type === "success" ? (
               <CheckCircle2 className="w-4 h-4 mt-0.5" />
             ) : (
@@ -3604,7 +3640,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           <div className="space-y-1">
             <div className="flex flex-wrap items-center justify-between gap-1">
               <div className="text-[10px] font-semibold text-blue-900">
-                Report Info status
+                {t("elRajhiUpload.reportInfoStatus")}
               </div>
               <span
                 className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
@@ -3614,15 +3650,17 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                 }`}
               >
                 {validationReportIssues.length
-                  ? `${validationReportIssues.length} issue(s)`
-                  : "All fields OK"}
+                  ? t("elRajhiUpload.issuesCount", {
+                      count: validationReportIssues.length,
+                    })
+                  : t("elRajhiUpload.allFieldsOkShort")}
               </span>
             </div>
             {hasReportInfoData ? (
               isValidationTableCollapsed ? (
                 <div className="flex items-center gap-1 text-[10px] text-blue-900/70">
                   <ChevronDown className="w-3 h-3" />
-                  Table hidden.
+                  {t("elRajhiUpload.tableHidden")}
                 </div>
               ) : (
                 <div className="overflow-x-auto max-h-[280px] overflow-y-auto">
@@ -3630,30 +3668,30 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                     <thead className="text-[10px] uppercase tracking-wide text-white/90">
                       <tr>
                         <th className="px-2 py-1 bg-blue-900/95 text-left rounded-l-lg">
-                          Field
+                          {t("elRajhiUpload.consoleColField")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left">
-                          Value
+                          {t("elRajhiUpload.consoleColValue")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left">
-                          Status
+                          {t("elRajhiUpload.consoleColStatus")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left rounded-r-lg">
-                          Notes
+                          {t("elRajhiUpload.consoleColNotes")}
                         </th>
                       </tr>
                     </thead>
                     <tbody>
                       {reportInfoFields.map((field) => {
                         const fieldIssues =
-                          reportInfoIssuesByField[field.label] || [];
+                          reportInfoIssuesByField[field.issueField] || [];
                         const hasIssue = fieldIssues.length > 0;
                         const hasFieldValue = hasValue(field.value);
                         const statusLabel = hasIssue
-                          ? "Issue"
+                          ? t("elRajhiUpload.statusIssue")
                           : hasFieldValue
-                            ? "OK"
-                            : "Missing";
+                            ? t("elRajhiUpload.statusOk")
+                            : t("elRajhiUpload.statusMissing");
                         const statusTone = hasIssue
                           ? "bg-rose-50 text-rose-700 border-rose-200"
                           : hasFieldValue
@@ -3664,15 +3702,17 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                               .map((issue) => issue.message)
                               .join(" / ")
                           : hasFieldValue
-                            ? "Looks good"
-                            : "Missing in Excel";
+                            ? t("elRajhiUpload.notesGood")
+                            : t("elRajhiUpload.notesMissingExcel");
                         return (
-                          <tr key={field.label}>
+                          <tr key={field.issueField}>
                             <td className="px-2 py-1 bg-white border border-blue-900/10 rounded-l-lg font-semibold text-blue-900">
                               {field.label}
                             </td>
                             <td className="px-2 py-1 bg-white border border-blue-900/10 text-blue-900/90">
-                              {hasFieldValue ? field.value : "N/A"}
+                              {hasFieldValue
+                                ? field.value
+                                : t("elRajhiUpload.naValue")}
                             </td>
                             <td className="px-2 py-1 bg-white border border-blue-900/10">
                               <span
@@ -3690,14 +3730,15 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                       {extraReportInfoIssues.map((issue, idx) => (
                         <tr key={`issue-extra-${idx}`}>
                           <td className="px-2 py-1 bg-white border border-blue-900/10 rounded-l-lg font-semibold text-blue-900">
-                            {issue.field || "Issue"}
+                            {issue.field || t("elRajhiUpload.fieldGeneral")}
                           </td>
                           <td className="px-2 py-1 bg-white border border-blue-900/10 text-blue-900/90">
-                            {issue.location || "Report Info"}
+                            {issue.location ||
+                              t("elRajhiUpload.reportInfoLocationFallback")}
                           </td>
                           <td className="px-2 py-1 bg-white border border-blue-900/10">
                             <span className="inline-flex items-center rounded-full border border-rose-200 bg-rose-50 px-1.5 py-0.5 text-[10px] font-semibold text-rose-700">
-                              Issue
+                              {t("elRajhiUpload.statusIssue")}
                             </span>
                           </td>
                           <td className="px-2 py-1 bg-white border border-blue-900/10 rounded-r-lg text-blue-900/80">
@@ -3715,11 +3756,13 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           <div className="space-y-1">
             <div className="flex flex-wrap items-center justify-between gap-1">
               <div className="text-[10px] font-semibold text-blue-900">
-                PDFs & assets validation
+                {t("elRajhiUpload.pdfAssetsValidation")}
               </div>
               <div className="flex flex-wrap items-center gap-1 text-[10px] font-semibold">
                 <span className="rounded-full border border-blue-100 bg-blue-50 px-2 py-0.5 text-blue-900">
-                  Assets: {validationReports.length}
+                  {t("elRajhiUpload.assetsCountLabel", {
+                    count: validationReports.length,
+                  })}
                 </span>
                 <span
                   className={`rounded-full border px-2 py-0.5 ${
@@ -3728,10 +3771,15 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                       : "border-blue-100 bg-blue-50 text-blue-700"
                   }`}
                 >
-                  PDF matches:{" "}
                   {validationReports.length
-                    ? `${pdfReportCount}/${validationReports.length}`
-                    : "0"}
+                    ? t("elRajhiUpload.pdfMatchesLabel", {
+                        matched: pdfReportCount,
+                        total: validationReports.length,
+                      })
+                    : t("elRajhiUpload.pdfMatchesLabel", {
+                        matched: 0,
+                        total: 0,
+                      })}
                 </span>
                 <span
                   className={`rounded-full border px-2 py-0.5 ${
@@ -3742,21 +3790,23 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                       : "border-blue-100 bg-blue-50 text-blue-700"
                   }`}
                 >
-                  Valuer totals: {valuerTotalsLabel}
+                  {t("elRajhiUpload.valuerTotalsWithLabel", {
+                    label: valuerTotalsLabel,
+                  })}
                 </span>
               </div>
             </div>
             {loadingValuers && (
               <div className="flex items-center gap-1 text-[10px] text-blue-900/70">
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Reading valuers from Excel...
+                {t("elRajhiUpload.readingValuers")}
               </div>
             )}
             {validationReports.length ? (
               isValidationTableCollapsed ? (
                 <div className="flex items-center gap-1 text-[10px] text-blue-900/70">
                   <ChevronDown className="w-3 h-3" />
-                  Table hidden.
+                  {t("elRajhiUpload.tableHidden")}
                 </div>
               ) : (
                 <div className="overflow-x-auto max-h-[280px] overflow-y-auto">
@@ -3764,25 +3814,25 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                     <thead className="text-[10px] uppercase tracking-wide text-white/90">
                       <tr>
                         <th className="px-2 py-1 bg-blue-900/95 text-left rounded-l-lg">
-                          #
+                          {t("elRajhiUpload.consoleColIdx")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left">
-                          Asset name
+                          {t("elRajhiUpload.consoleColAssetName")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left">
-                          PDF match
+                          {t("elRajhiUpload.consoleColPdfMatch")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left">
-                          Client name
+                          {t("elRajhiUpload.consoleColClientNameShort")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left">
-                          Valuers (ID / Name / %)
+                          {t("elRajhiUpload.consoleColValuers")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left">
-                          Total %
+                          {t("elRajhiUpload.consoleColTotalPct")}
                         </th>
                         <th className="px-2 py-1 bg-blue-900/95 text-left rounded-r-lg">
-                          Report ID
+                          {t("elRajhiUpload.consoleColReportIdShort")}
                         </th>
                       </tr>
                     </thead>
@@ -3808,7 +3858,10 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                               {idx + 1}
                             </td>
                             <td className="px-2 py-1 bg-white border border-blue-900/10 font-semibold text-blue-900">
-                              {report.asset_name || `Asset ${idx + 1}`}
+                              {report.asset_name ||
+                                t("elRajhiUpload.consoleAssetFallback", {
+                                  n: idx + 1,
+                                })}
                             </td>
                             <td className="px-2 py-1 bg-white border border-blue-900/10">
                               {report.pdf_name ? (
@@ -3820,12 +3873,13 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                 </div>
                               ) : (
                                 <span className="text-[10px] text-slate-500">
-                                  No matching PDF
+                                  {t("elRajhiUpload.noMatchingPdf")}
                                 </span>
                               )}
                             </td>
                             <td className="px-2 py-1 bg-white border border-blue-900/10 text-blue-900/80">
-                              {report.client_name || "Pending"}
+                              {report.client_name ||
+                                t("elRajhiUpload.pendingShort")}
                             </td>
                             <td className="px-2 py-1 bg-white border border-blue-900/10">
                               <div className="flex flex-wrap gap-1 text-[10px]">
@@ -3836,9 +3890,13 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                       className="inline-flex items-center gap-1 rounded-full border border-blue-100 bg-blue-50 px-1.5 py-0.5 text-blue-900"
                                     >
                                       <span className="font-semibold">
-                                        {v.valuerId || "N/A"}
+                                        {v.valuerId ||
+                                          t("elRajhiUpload.naValue")}
                                       </span>
-                                      <span>{v.valuerName || "N/A"}</span>
+                                      <span>
+                                        {v.valuerName ||
+                                          t("elRajhiUpload.naValue")}
+                                      </span>
                                       <span>
                                         ({Number(v.percentage ?? 0)}%)
                                       </span>
@@ -3846,7 +3904,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                   ))
                                 ) : (
                                   <span className="text-[10px] text-slate-400">
-                                    N/A
+                                    {t("elRajhiUpload.naValue")}
                                   </span>
                                 )}
                               </div>
@@ -3855,7 +3913,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                               <span
                                 className={`font-semibold text-[10px] ${totalTone}`}
                               >
-                                {hasValuerData ? `${totalPct}%` : "N/A"}
+                                {hasValuerData
+                                  ? `${totalPct}%`
+                                  : t("elRajhiUpload.naValue")}
                               </span>
                             </td>
                             <td className="px-2 py-1 bg-white border border-blue-900/10 rounded-r-lg">
@@ -3866,7 +3926,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                 </span>
                               ) : (
                                 <span className="text-[10px] text-slate-400">
-                                  Pending
+                                  {t("elRajhiUpload.pendingShort")}
                                 </span>
                               )}
                             </td>
@@ -3886,216 +3946,206 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
   const validationContent = (
     <div className="space-y-1.5">
-      <div className="space-y-1">
-        <div className="rounded-2xl border border-blue-900/15 bg-white shadow-sm p-2">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <label className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg border border-blue-900/15 bg-white/90 cursor-pointer hover:bg-blue-50 transition min-w-[170px] flex-[0.85]">
-              <div className="flex items-center gap-2 text-[10px] text-blue-900">
-                <FolderOpen className="w-4 h-4" />
-                <span className="font-semibold">
-                  {validationExcelFile
-                    ? validationExcelFile.name
-                    : rememberedFiles.validationExcel
-                      ? `Last: ${rememberedFiles.validationExcel}`
-                      : "Choose Excel file"}
-                </span>
-              </div>
-              <input
-                ref={validationExcelInputRef}
-                type="file"
-                accept=".xlsx,.xls"
-                className="hidden"
-                onChange={handleValidationExcelChange}
-                onClick={(e) => {
-                  e.currentTarget.value = null;
-                }}
-              />
-              <span className="text-[10px] font-semibold text-blue-900">
-                Browse
+      <div className="rounded-xl border border-slate-200/90 bg-gradient-to-b from-slate-50/60 to-white p-2 shadow-sm">
+        <div className="flex w-full min-w-0 flex-wrap items-stretch gap-2 sm:gap-2.5 lg:flex-nowrap">
+          <label className="flex h-9 min-h-9 min-w-[13rem] flex-[2] cursor-pointer items-center justify-between gap-2 rounded-lg border border-slate-200/90 bg-white px-2.5 text-[10px] font-semibold text-slate-800 shadow-sm transition hover:border-slate-300">
+            <div className="flex min-w-0 flex-1 items-center gap-1.5">
+              <FileSpreadsheet className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
+              <span className="min-w-0 truncate">
+                {validationExcelFile
+                  ? validationExcelFile.name
+                  : rememberedFiles.validationExcel
+                    ? t("elRajhiUpload.lastExcel", {
+                        name: rememberedFiles.validationExcel,
+                      })
+                    : t("elRajhiUpload.chooseExcel")}
               </span>
-            </label>
-            <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded-lg border border-blue-900/15 bg-white/90 transition hover:bg-blue-50 min-w-[230px] flex-[1.35]">
-              <div className="flex flex-wrap items-center gap-2 text-[10px] text-blue-900">
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 text-blue-900 border-blue-500 focus:ring-blue-600"
-                  checked={wantsPdfUpload}
-                  onChange={(e) => handlePdfToggle(e.target.checked)}
-                />
-                <Files className="w-4 h-4" />
-                <span className="font-semibold">Upload PDFs</span>
-                <span
-                  dir="rtl"
-                  className="text-[9px] text-blue-800/70 leading-snug"
-                >
-                  هل تريد الحاق ملفات pdf ام تريد استخدام ملفات مؤقته
-                </span>
-                <span className="text-[10px] text-blue-800/80">
-                  {validationPdfFiles.length
-                    ? `${validationPdfFiles.length} file(s) selected`
-                    : rememberedFiles.validationPdfs.length
-                      ? `Last: ${rememberedFiles.validationPdfs.length} PDF(s)`
-                      : "Choose PDF files"}
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => handlePdfToggle(true)}
-                className="text-[10px] font-semibold text-blue-900 hover:text-blue-800"
-              >
-                Browse
-              </button>
+            </div>
+            <input
+              ref={validationExcelInputRef}
+              type="file"
+              accept=".xlsx,.xls"
+              className="hidden"
+              onChange={handleValidationExcelChange}
+              onClick={(e) => {
+                e.currentTarget.value = null;
+              }}
+            />
+            <span className="shrink-0 text-[10px] font-semibold text-emerald-700">
+              {t("elRajhiUpload.browse")}
+            </span>
+          </label>
+
+          <div className="flex h-9 min-h-9 min-w-[13rem] flex-[2] items-center justify-between gap-1.5 rounded-lg border border-slate-200/90 bg-white px-2.5 text-[10px] shadow-sm">
+            <div className="flex min-w-0 flex-1 items-center gap-1.5 text-slate-800">
               <input
-                ref={validationPdfInputRef}
-                type="file"
-                multiple
-                accept=".pdf"
-                className="hidden"
-                onChange={handleValidationPdfsChange}
-                onClick={(e) => {
-                  e.currentTarget.value = null;
-                }}
+                type="checkbox"
+                className="h-3 w-3 shrink-0 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                checked={wantsPdfUpload}
+                onChange={(e) => handlePdfToggle(e.target.checked)}
+              />
+              <Files className="h-3.5 w-3.5 shrink-0 text-slate-600" />
+              <span className="shrink-0 font-semibold">
+                {t("elRajhiUpload.uploadPdfs")}
+              </span>
+              <span className="min-w-0 truncate text-slate-500">
+                {validationPdfFiles.length
+                  ? t("elRajhiUpload.pdfSelectedCount", {
+                      count: validationPdfFiles.length,
+                    })
+                  : rememberedFiles.validationPdfs.length
+                    ? t("elRajhiUpload.lastPdfCount", {
+                        count: rememberedFiles.validationPdfs.length,
+                      })
+                    : "—"}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => handlePdfToggle(true)}
+              className="shrink-0 text-[10px] font-semibold text-emerald-700 hover:text-emerald-800"
+            >
+              {t("elRajhiUpload.browse")}
+            </button>
+            <input
+              ref={validationPdfInputRef}
+              type="file"
+              multiple
+              accept=".pdf"
+              className="hidden"
+              onChange={handleValidationPdfsChange}
+              onClick={(e) => {
+                e.currentTarget.value = null;
+              }}
+            />
+          </div>
+
+          <label
+            className="inline-flex h-9 min-h-9 w-[7.5rem] max-w-[8.5rem] shrink-0 cursor-pointer items-center justify-center gap-1 rounded-lg border border-emerald-200/70 bg-emerald-50/50 px-1.5 text-[9px] font-medium leading-tight text-emerald-900 shadow-sm transition hover:bg-emerald-50 sm:w-[8rem] sm:text-[10px]"
+            title={t("elRajhiUpload.sendToConfirmer")}
+          >
+            <input
+              type="checkbox"
+              className="h-3 w-3 shrink-0 rounded border-emerald-300 text-emerald-600 focus:ring-emerald-500"
+              checked={sendToConfirmerValidation}
+              onChange={(e) =>
+                setSendToConfirmerValidation(e.target.checked)
+              }
+            />
+            <span className="line-clamp-2 min-w-0 text-center leading-tight">
+              {t("elRajhiUpload.sendToConfirmerShort")}
+            </span>
+          </label>
+
+          <button
+            type="button"
+            onClick={handleSubmitElrajhi}
+            disabled={
+              sendingValidation || !canSendReports || !elrajhiCompanyContext
+            }
+            title={
+              sendingValidation || (canSendReports && elrajhiCompanyContext)
+                ? undefined
+                : !elrajhiCompanyContext
+                  ? t("elRajhiUpload.tooltipNeedCompany")
+                  : t("elRajhiUpload.tooltipFixExcel")
+            }
+            className="inline-flex h-9 min-h-9 min-w-[8.5rem] flex-[1.15] items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-2.5 text-[10px] font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
+          >
+            {sendingValidation ? (
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+            ) : (
+              <Send className="h-3.5 w-3.5 shrink-0" />
+            )}
+            <span className="min-w-0 truncate text-center font-semibold">
+              {t("elRajhiUpload.uploadReports")}
+            </span>
+          </button>
+
+          {sendingValidation ? (
+            <div className="flex min-w-0 flex-none flex-wrap items-center justify-center gap-1 lg:justify-start">
+              <ControlButtons
+                compact
+                isPaused={isPausedValidation}
+                isRunning={sendingValidation}
+                onPause={handlePauseValidation}
+                onResume={handleResumeValidation}
+                onStop={handleStopValidation}
               />
             </div>
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={handleDownloadTemplate}
-                disabled={downloadingTemplate}
-                className="inline-flex items-center gap-1.5 rounded-md border border-blue-900/20 bg-white px-2.5 py-1.5 text-[10px] font-semibold text-blue-900 hover:bg-blue-50 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {downloadingTemplate ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Download className="w-4 h-4" />
-                )}
-                {downloadingTemplate
-                  ? "Downloading..."
-                  : "Export Excel Template"}
-              </button>
-              <button
-                type="button"
-                onClick={resetValidationSection}
-                className="inline-flex items-center gap-2 rounded-md border border-blue-900/20 bg-white px-2.5 py-1.5 text-[10px] font-semibold text-blue-900 hover:bg-blue-50"
-              >
-                <RefreshCw className="w-4 h-4" />
-                Reset
-              </button>
-            </div>
-          </div>
-        </div>
+          ) : null}
 
-        <div className="relative overflow-hidden rounded-2xl border border-blue-900/15 mb-2 bg-gradient-to-br from-blue-50/70 via-white to-blue-50/40 p-2 shadow-sm">
-          <div className="absolute -right-10 -top-8 h-24 w-24 rounded-full bg-blue-900/10 blur-2xl" />
-          <div className="relative flex flex-col gap-2">
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={handleSubmitElrajhi}
-                disabled={
-                  sendingValidation ||
-                  !canSendReports ||
-                  !elrajhiCompanyContext
-                }
-                title={
-                  sendingValidation || (canSendReports && elrajhiCompanyContext)
-                    ? undefined
-                    : !elrajhiCompanyContext
-                      ? "Select a company (office) from the app sidebar before sending."
-                      : "Load Excel validation: market assets required, valuer columns must sum to 100% if present, and fix any report-info errors above."
-                }
-                className="inline-flex items-center gap-2 px-2.5 py-1 rounded-md bg-emerald-600 text-white text-[10px] font-semibold hover:bg-emerald-700 disabled:opacity-50"
-              >
-                {sendingValidation ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Send className="w-4 h-4" />
-                )}
-                Send all reports
-              </button>
-              {sendingValidation && (
-                <ControlButtons
-                  isPaused={isPausedValidation}
-                  isRunning={sendingValidation}
-                  onPause={handlePauseValidation}
-                  onResume={handleResumeValidation}
-                  onStop={handleStopValidation}
-                />
-              )}
-              <button
-                type="button"
-                onClick={handleSubmitPdfOnly}
-                disabled={pdfOnlySending || !canSendPdfOnly}
-                className="inline-flex items-center gap-2 px-2.5 py-1 rounded-md bg-blue-900 text-white text-[10px] font-semibold hover:bg-blue-800 disabled:opacity-50"
-              >
-                {pdfOnlySending ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Files className="w-4 h-4" />
-                )}
-                Send only reports with PDFs
-              </button>
-              {pdfOnlySending && (
-                <ControlButtons
-                  isPaused={isPausedPdfOnly}
-                  isRunning={pdfOnlySending}
-                  onPause={handlePausePdfOnly}
-                  onResume={handleResumePdfOnly}
-                  onStop={handleStopPdfOnly}
-                />
-              )}
+          <button
+            type="button"
+            onClick={resetValidationSection}
+            title={t("elRajhiUpload.reset")}
+            aria-label={t("elRajhiUpload.reset")}
+            className="inline-flex h-9 min-h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 shadow-sm transition hover:border-slate-300 hover:bg-slate-50"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+          </button>
 
-              <label className="inline-flex items-center gap-2 px-2 py-1 rounded-lg border border-blue-900/15 bg-white/80 text-[10px] font-semibold text-blue-900 flex min-w-[240px]">
-                <input
-                  type="checkbox"
-                  className="h-4 w-4 text-blue-900 border-blue-500 focus:ring-blue-600"
-                  checked={sendToConfirmerValidation}
-                  onChange={(e) =>
-                    setSendToConfirmerValidation(e.target.checked)
-                  }
-                />
-                <span>
-                  Do you want to send the report to the confirmer? / هل تريد
-                  ارسال التقارير الي المعتمد مباشرة ؟
-                </span>
-              </label>
-            </div>
-            {validationReportIssues.length ? (
-              <div className="flex items-center gap-2 text-[10px] text-rose-600">
-                <AlertTriangle className="w-4 h-4" />
-                Resolve the report info issues above to enable sending.
-              </div>
-            ) : null}
-          </div>
+          <button
+            type="button"
+            onClick={handleDownloadTemplate}
+            disabled={downloadingTemplate}
+            aria-label={t("elRajhiUpload.exportTemplate")}
+            className="inline-flex h-9 min-h-9 w-[6.5rem] max-w-[7.25rem] shrink-0 items-center justify-center gap-1 rounded-lg border border-slate-200/90 bg-white px-1.5 text-[9px] font-semibold text-slate-800 shadow-sm transition hover:border-emerald-300/60 hover:bg-emerald-50/50 disabled:cursor-not-allowed disabled:opacity-55 sm:w-[7rem] sm:text-[10px]"
+          >
+            {downloadingTemplate ? (
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-600" />
+            ) : (
+              <img
+                src={excelIconImg}
+                alt=""
+                width={16}
+                height={16}
+                className="h-3.5 w-3.5 shrink-0 object-contain"
+              />
+            )}
+            <span className="line-clamp-2 min-w-0 text-center font-semibold leading-tight">
+              {downloadingTemplate
+                ? t("elRajhiUpload.downloading")
+                : t("elRajhiUpload.exportTemplate")}
+            </span>
+          </button>
         </div>
+        {validationReportIssues.length ? (
+          <div className="mt-2 flex items-center gap-1.5 border-t border-slate-200/60 pt-2 text-[10px] text-rose-700">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            {t("elRajhiUpload.resolveIssues")}
+          </div>
+        ) : null}
       </div>
     </div>
   );
 
-  const validationModal = showValidationModal ? (
+  /** يُعرض على document.body ليتجاوز سياق الطبقة في Layout (header z-100، تابات، main z-10). */
+  const validationModalLayer = showValidationModal ? (
     <div
-      className="fixed inset-0 z-[60] flex items-start justify-center overflow-y-auto px-4 py-6"
+      dir={pageDir}
+      className="fixed inset-0 z-[5500] flex items-start justify-center overflow-y-auto px-4 pt-[max(1.5rem,env(safe-area-inset-top))] pb-6"
       onClick={() => setShowValidationModal(false)}
     >
-      <div className="absolute inset-0 bg-slate-900/70 backdrop-blur-sm" />
+      <div className="absolute inset-0 z-0 bg-slate-900/70 backdrop-blur-sm" />
       <div
-        className="relative w-full max-w-5xl"
+        className="relative z-10 mt-2 w-full max-w-5xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="rounded-2xl border border-blue-900/20 bg-white shadow-[0_30px_90px_rgba(15,23,42,0.35)]">
-          <div className="flex items-center justify-between border-b border-blue-900/10 bg-slate-50 px-4 py-3">
-            <div className="text-sm font-semibold text-blue-900">
-              Validation results
+        <div className="rounded-xl border border-slate-200 bg-white shadow-sm">
+          <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50/80 px-3 py-2">
+            <div className="text-sm font-semibold text-slate-800">
+              {t("elRajhiUpload.validationTitle")}
             </div>
             <button
               type="button"
               onClick={() => setShowValidationModal(false)}
-              className="text-[10px] font-semibold text-blue-900 hover:text-blue-700"
+              className="text-[11px] font-semibold text-emerald-700 hover:text-emerald-800"
             >
-              Close
+              {t("elRajhiUpload.close")}
             </button>
           </div>
-          <div className="max-h-[70vh] overflow-y-auto p-3">
+          <div className="max-h-[70vh] overflow-y-auto p-2">
             {validationConsole}
           </div>
         </div>
@@ -4104,27 +4154,29 @@ const UploadReportElrajhi = ({ onViewChange }) => {
   ) : null;
 
   const noValidationContent = (
-    <div className="space-y-6">
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="p-4 border border-slate-200 rounded-xl bg-white shadow-sm space-y-3">
+    <div className="space-y-3">
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-2 md:gap-3">
+        <div className="space-y-2 rounded-lg border border-slate-200/90 bg-white p-2.5 shadow-sm">
           <div className="flex items-center gap-2">
-            <span className="px-2 py-1 text-[11px] font-semibold rounded-full bg-blue-50 text-blue-700 border border-blue-100">
-              Step 1
+            <span className="inline-flex h-5 min-w-[1.35rem] items-center justify-center rounded bg-emerald-100 px-1 text-[10px] font-bold text-emerald-900">
+              {t("elRajhiUpload.step1")}
             </span>
-            <FileSpreadsheet className="w-5 h-5 text-blue-600" />
-            <h3 className="text-sm font-semibold text-gray-900">
-              Upload Excel (Report Info + market)
+            <FileSpreadsheet className="h-3.5 w-3.5 text-emerald-700" />
+            <h3 className="text-xs font-semibold text-slate-900">
+              {t("elRajhiUpload.mainExcelTitle")}
             </h3>
           </div>
-          <label className="flex items-center justify-between px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-100 transition">
-            <div className="flex items-center gap-2 text-sm text-gray-800">
-              <FolderOpen className="w-4 h-4" />
-              <span>
+          <label className="flex cursor-pointer items-center justify-between gap-2 rounded-md border border-slate-200 bg-slate-50/80 px-1.5 py-1 transition hover:bg-slate-100">
+            <div className="flex min-w-0 items-center gap-1.5 text-[10px] text-slate-800">
+              <FolderOpen className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">
                 {excelFile
                   ? excelFile.name
                   : rememberedFiles.mainExcel
-                    ? `Last: ${rememberedFiles.mainExcel}`
-                    : "Choose Excel file"}
+                    ? t("elRajhiUpload.lastExcel", {
+                        name: rememberedFiles.mainExcel,
+                      })
+                    : t("elRajhiUpload.chooseExcel")}
               </span>
             </div>
             <input
@@ -4137,38 +4189,35 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                 e.currentTarget.value = null;
               }}
             />
-            <span className="text-xs text-blue-600 font-semibold">Browse</span>
+            <span className="shrink-0 text-[10px] font-semibold text-emerald-700">
+              {t("elRajhiUpload.browse")}
+            </span>
           </label>
-          <div className="flex items-center justify-end text-xs">
-            <button
-              onClick={clearAll}
-              className="inline-flex items-center gap-2 px-2.5 py-1.5 rounded-md bg-slate-100 text-gray-700 text-xs font-semibold hover:bg-slate-200"
-            >
-              <RefreshCw className="w-4 h-4" />
-              Reset
-            </button>
-          </div>
         </div>
 
-        <div className="p-4 border border-slate-200 rounded-xl bg-white shadow-sm space-y-3">
+        <div className="space-y-2 rounded-lg border border-slate-200/90 bg-white p-2.5 shadow-sm">
           <div className="flex items-center gap-2">
-            <span className="px-2 py-1 text-[11px] font-semibold rounded-full bg-purple-50 text-purple-700 border border-purple-100">
-              Step 2
+            <span className="inline-flex h-5 min-w-[1.35rem] items-center justify-center rounded bg-slate-200 px-1 text-[10px] font-bold text-slate-800">
+              {t("elRajhiUpload.step2")}
             </span>
-            <Files className="w-5 h-5 text-purple-600" />
-            <h3 className="text-sm font-semibold text-gray-900">
-              Upload PDFs (match by asset_name)
+            <Files className="h-3.5 w-3.5 text-slate-600" />
+            <h3 className="text-xs font-semibold text-slate-900">
+              {t("elRajhiUpload.mainPdfTitle")}
             </h3>
           </div>
-          <label className="flex items-center justify-between px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer hover:bg-slate-100 transition">
-            <div className="flex items-center gap-2 text-sm text-gray-800">
-              <FolderOpen className="w-4 h-4" />
-              <span>
+          <label className="flex cursor-pointer items-center justify-between gap-2 rounded-md border border-slate-200 bg-slate-50/80 px-1.5 py-1 transition hover:bg-slate-100">
+            <div className="flex min-w-0 items-center gap-1.5 text-[10px] text-slate-800">
+              <FolderOpen className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">
                 {pdfFiles.length
-                  ? `${pdfFiles.length} file(s) selected`
+                  ? t("elRajhiUpload.pdfSelectedCount", {
+                      count: pdfFiles.length,
+                    })
                   : rememberedFiles.mainPdfs.length
-                    ? `Last: ${rememberedFiles.mainPdfs.length} PDF(s)`
-                    : "Choose PDF files"}
+                    ? t("elRajhiUpload.lastPdfCount", {
+                        count: rememberedFiles.mainPdfs.length,
+                      })
+                    : t("elRajhiUpload.uploadPdfs")}
               </span>
             </div>
             <input
@@ -4182,33 +4231,20 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                 e.currentTarget.value = null;
               }}
             />
-            <span className="text-xs text-blue-600 font-semibold">Browse</span>
+            <span className="shrink-0 text-[10px] font-semibold text-emerald-700">
+              {t("elRajhiUpload.browse")}
+            </span>
           </label>
-          <div className="grid grid-cols-[auto,1fr] gap-y-2 gap-x-3 items-center">
-            <label className="text-xs font-semibold text-gray-700 col-span-2">
-              Tabs configuration:
-            </label>
-            <div className="flex items-center gap-2 px-3 py-2 bg-slate-100 rounded-md border border-slate-200">
-              <Table className="w-4 h-4 text-blue-600" />
-              <span className="text-sm font-semibold text-gray-800">
-                {recommendedTabs} tab{recommendedTabs !== 1 ? "s" : ""}
-              </span>
-              <span className="text-xs text-gray-600 ml-2">
-                (auto-configured)
-              </span>
-            </div>
-          </div>
-
-          <div className="flex gap-2">
+          <div className="flex gap-1.5">
             <button
               onClick={() => {
                 setPdfFiles([]);
                 resetMessages();
               }}
-              className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-slate-100 text-gray-700 text-sm hover:bg-slate-200"
+              className="inline-flex items-center gap-1.5 rounded-md bg-slate-100 px-1.5 py-1 text-[10px] font-semibold text-slate-800 hover:bg-slate-200"
             >
-              <RefreshCw className="w-4 h-4" />
-              Clear PDFs
+              <RefreshCw className="h-3 w-3" />
+              {t("elRajhiUpload.clearPdfs")}
             </button>
           </div>
         </div>
@@ -4233,48 +4269,66 @@ const UploadReportElrajhi = ({ onViewChange }) => {
 
       {mainReportSnapshot || mainReportIssues.length ? (
         <ValidationResultsCard
-          title="Report Info validation"
+          title={t("elRajhiUpload.validationCardTitle")}
           issues={mainReportIssues}
           snapshot={mainReportSnapshot}
         />
       ) : null}
 
-      <div className="mt-3 space-y-3">
-        <label className="inline-flex items-start gap-2 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg">
-          <input
-            type="checkbox"
-            className="mt-1 h-4 w-4 text-amber-600 border-amber-400 focus:ring-amber-500"
-            checked={sendToConfirmerMain}
-            onChange={(e) => setSendToConfirmerMain(e.target.checked)}
-          />
-          <span className="text-sm text-gray-800 font-semibold leading-5">
-            Do you want to send the report to the confirmer? / هل تريد ارسال
-            التقرير الي المعتمد ؟
-          </span>
-        </label>
-        <div className="flex items-center gap-3">
+      <div className="mt-2 space-y-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={sendToTaqeem}
+            onClick={(e) => {
+              if (e.target.closest("[data-confirmer-toggle]")) return;
+              sendToTaqeem();
+            }}
             disabled={
               sendingTaqeem ||
               !excelFile ||
               !pdfFiles.length ||
               mainReportIssues.length > 0
             }
-            className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-emerald-600 text-white text-sm font-semibold shadow-sm hover:bg-emerald-700 disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-[10px] font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-50"
           >
+            <span
+              data-confirmer-toggle
+              className="inline-flex max-w-[5.5rem] cursor-pointer flex-col gap-0 border-r border-white/25 pr-2 text-start leading-tight sm:max-w-[6.5rem]"
+              role="presentation"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <label className="inline-flex cursor-pointer items-center gap-1">
+                <input
+                  type="checkbox"
+                  className="h-3 w-3 shrink-0 rounded border-white/50 bg-white/10 text-emerald-600"
+                  checked={sendToConfirmerMain}
+                  onChange={(e) => setSendToConfirmerMain(e.target.checked)}
+                  onClick={(e) => e.stopPropagation()}
+                />
+                <span className="text-[9px] font-medium text-white/95">
+                  {t("elRajhiUpload.sendToConfirmerShort")}
+                </span>
+              </label>
+            </span>
             {sendingTaqeem ? (
-              <Loader2 className="w-4 h-4 animate-spin" />
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
             ) : (
-              <Send className="w-4 h-4" />
+              <Send className="h-3.5 w-3.5 shrink-0" />
             )}
-            Send to Taqeem
+            {t("elRajhiUpload.uploadReports")}
+          </button>
+          <button
+            type="button"
+            onClick={clearAll}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-2 text-[10px] font-semibold text-slate-800 shadow-sm hover:bg-slate-50"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            {t("elRajhiUpload.reset")}
           </button>
           {mainReportIssues.length > 0 && (
-            <div className="flex items-center gap-2 text-xs text-red-600">
-              <AlertTriangle className="w-4 h-4" />
-              Resolve the report info issues above to enable sending.
+            <div className="flex items-center gap-1.5 text-[10px] text-rose-700">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+              {t("elRajhiUpload.resolveIssues")}
             </div>
           )}
           {sendingTaqeem && (
@@ -4293,18 +4347,18 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         <div className="bg-white border rounded-lg shadow-sm">
           <div className="px-4 py-3 border-b flex items-center gap-2 justify-between">
             <div className="flex items-center gap-2">
-              <Info className="w-4 h-4 text-blue-600" />
+              <Info className="w-4 h-4 text-emerald-700" />
               <div>
-                <p className="text-sm font-semibold text-gray-800">
-                  Created Reports
+                <p className="text-sm font-semibold text-slate-800">
+                  {t("elRajhiUpload.createdReports")}
                 </p>
-                <p className="text-xs text-gray-500">
-                  Batch: {excelResult.batchId}
+                <p className="text-[11px] text-slate-600">
+                  {t("elRajhiUpload.batchLabel", { id: excelResult.batchId })}
                 </p>
                 {excelResult.source === "system" && (
-                  <p className="mt-1 inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-800 bg-emerald-50 border border-emerald-100 px-2 py-1 rounded">
-                    <CheckCircle2 className="w-3 h-3" />
-                    Reports created from system upload
+                  <p className="mt-1 inline-flex items-center gap-1 rounded border border-emerald-100 bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">
+                    <CheckCircle2 className="h-3 w-3" />
+                    {t("elRajhiUpload.fromSystemUpload")}
                   </p>
                 )}
               </div>
@@ -4338,7 +4392,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                     window.URL.revokeObjectURL(url);
                   } catch (err) {
                     console.error("Failed to download updated Excel", err);
-                    setError("Failed to download updated Excel");
+                    setError(t("elRajhiUpload.downloadExcelFailed"));
                   } finally {
                     setDownloadingExcel(false);
                   }
@@ -4351,7 +4405,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                 ) : (
                   <Download className="w-4 h-4" />
                 )}
-                {downloadingExcel ? "Preparing..." : "Download updated Excel"}
+                {downloadingExcel
+                  ? t("elRajhiUpload.preparingShort")
+                  : t("elRajhiUpload.downloadUpdatedExcelBtn")}
               </button>
             )}
           </div>
@@ -4359,21 +4415,29 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-blue-100 text-blue-700 text-xs font-bold">
               {batchList.length || 0}
             </span>
-            Batches
+            {t("elRajhiUpload.batchesLabel")}
           </div>
           <div className="mb-2">{validationSummarySection}</div>
           <div className="mb-1 text-xs text-blue-900/80 font-semibold">
-            All batches
+            {t("elRajhiUpload.allBatchesSection")}
           </div>
           <div className="overflow-x-auto">
             <table className="min-w-full text-sm">
               <thead className="bg-gray-50">
                 <tr className="text-left text-gray-600">
-                  <th className="px-4 py-2">#</th>
-                  <th className="px-4 py-2">Asset Name</th>
-                  <th className="px-4 py-2">Client Name</th>
-                  <th className="px-4 py-2">PDF Path</th>
-                  <th className="px-4 py-2">Report ID</th>
+                  <th className="px-4 py-2">{t("elRajhiUpload.reportColNum")}</th>
+                  <th className="px-4 py-2">
+                    {t("elRajhiUpload.reportColAssetName")}
+                  </th>
+                  <th className="px-4 py-2">
+                    {t("elRajhiUpload.reportColClientName")}
+                  </th>
+                  <th className="px-4 py-2">
+                    {t("elRajhiUpload.reportColPdfPath")}
+                  </th>
+                  <th className="px-4 py-2">
+                    {t("elRajhiUpload.reportColReportId")}
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -4391,7 +4455,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                           {r.pdf_path || r.path_pdf}
                         </span>
                       ) : (
-                        <span className="text-gray-400">Not uploaded</span>
+                        <span className="text-gray-400">
+                          {t("elRajhiUpload.notUploaded")}
+                        </span>
                       )}
                     </td>
                     <td className="px-4 py-2 text-gray-700">
@@ -4402,7 +4468,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                         </span>
                       ) : (
                         <span className="text-gray-400">
-                          Pending from Taqeem
+                          {t("elRajhiUpload.pendingTaqeem")}
                         </span>
                       )}
                     </td>
@@ -4413,18 +4479,18 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           </div>
         </div>
       ) : (
-        <div className="text-sm text-gray-500 flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4" />
-          No results yet.
+        <div className="flex items-center gap-2 text-[11px] text-slate-600">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          {t("elRajhiUpload.noResults")}
         </div>
       )}
     </div>
   );
 
   const checkReportsContent = (
-    <div className="space-y-1.5 text-[10px]">
+    <div className="batch-reports-panel space-y-3 text-sm leading-relaxed text-slate-900">
       {batchMessage && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
+        <div className="fixed inset-0 z-[400] flex items-center justify-center bg-black/30 p-4">
           <div
             className={`w-full max-w-md rounded-xl border shadow-lg p-4 relative ${
               batchMessage.type === "error"
@@ -4438,7 +4504,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
               type="button"
               className="absolute top-2 right-2 text-xs text-slate-500 hover:text-slate-700"
               onClick={() => setBatchMessage(null)}
-              aria-label="Close alert"
+              aria-label={t("elRajhiUpload.closeAlert")}
             >
               ×
             </button>
@@ -4450,7 +4516,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
               ) : (
                 <Info className="w-4 h-4 mt-0.5" />
               )}
-              <div className="text-[11px] leading-relaxed">
+              <div className="text-sm leading-relaxed">
                 {batchMessage.text}
               </div>
             </div>
@@ -4458,29 +4524,29 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         </div>
       )}
 
-      <div className="bg-white border border-blue-900/15 rounded-2xl shadow-sm overflow-hidden">
+      <div className="rounded-lg border border-slate-200/90 bg-white shadow-sm overflow-hidden">
         {batchLoading && !batchList.length ? (
-          <div className="p-3 flex items-center gap-2 text-[10px] text-blue-900/70">
-            <Loader2 className="w-4 h-4 animate-spin text-blue-900" />
-            Loading batches...
+          <div className="flex items-center gap-2.5 p-4 text-sm text-slate-600">
+            <Loader2 className="h-4 w-4 animate-spin text-emerald-700" />
+            {t("elRajhiUpload.loadingBatches")}
           </div>
         ) : batchList.length ? (
           <div className="overflow-x-auto">
-            <div className="mb-1 text-xs font-semibold text-blue-900 flex items-center gap-2">
-              <span className="inline-flex items-center justify-center w-5 h-5 rounded-full bg-blue-100 text-blue-700 text-[10px] font-bold">
+            <div className="mb-2 flex items-center gap-2.5 px-3 py-2 text-sm font-semibold text-slate-800">
+              <span className="inline-flex h-6 min-w-[1.5rem] items-center justify-center rounded-full bg-emerald-100 text-xs font-bold text-emerald-900 px-1">
                 {batchList.length || 0}
               </span>
-              All batches
+              {t("elRajhiUpload.allBatches")}
             </div>
-            <table className="min-w-full text-[10px] leading-tight">
-              <thead className="bg-blue-900/95 text-white/90">
+            <table className="batch-main-table min-w-full text-sm leading-relaxed">
+              <thead className="bg-slate-800 text-slate-100">
                 <tr>
-                  <th className="px-1.5 py-0.5 text-left">Local</th>
-                  <th className="px-1.5 py-0.5 text-left">Batch ID</th>
-                  <th className="px-1.5 py-0.5 text-left">Reports</th>
-                  <th className="px-1.5 py-0.5 text-left">With report ID</th>
-                  <th className="px-1.5 py-0.5 text-left">Complete</th>
-                  <th className="px-1.5 py-0.5 text-left"></th>
+                  <th className="px-3 py-2.5 text-start">{t("elRajhiUpload.colLocal")}</th>
+                  <th className="px-3 py-2.5 text-start">{t("elRajhiUpload.colBatchId")}</th>
+                  <th className="px-3 py-2.5 text-start">{t("elRajhiUpload.colReports")}</th>
+                  <th className="px-3 py-2.5 text-start">{t("elRajhiUpload.colWithId")}</th>
+                  <th className="px-3 py-2.5 text-start">{t("elRajhiUpload.colComplete")}</th>
+                  <th className="px-3 py-2.5 text-start">{t("elRajhiUpload.colActions")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -4522,56 +4588,61 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                   return (
                     <React.Fragment key={batch.batchId}>
                       <tr className="border-b border-blue-900/10 last:border-0">
-                        <td className="px-1.5 py-0.5 text-blue-900/80">
+                        <td className="px-3 py-2.5 text-blue-900/80 align-top">
                           {localNumber}
                         </td>
-                        <td className="px-1.5 py-0.5">
+                        <td className="px-3 py-2.5 align-top">
                           <button
                             type="button"
                             onClick={() => toggleBatchExpand(batch.batchId)}
-                            className="inline-flex items-center gap-2 text-left text-[10px] font-semibold text-blue-900"
+                            className="inline-flex items-center gap-2 text-left text-sm font-semibold text-blue-900"
                           >
                             {isExpanded ? (
-                              <ChevronDown className="w-4 h-4 text-blue-900/60" />
+                              <ChevronDown className="w-5 h-5 shrink-0 text-blue-900/60" />
                             ) : (
-                              <ChevronRight className="w-4 h-4 text-blue-900/60" />
+                              <ChevronRight className="w-5 h-5 shrink-0 text-blue-900/60" />
                             )}
                             <span>{batch.batchId}</span>
                           </button>
                           {batch.excelName ? (
-                            <p className="text-[10px] text-blue-900/60 ml-6">
+                            <p className="mt-1 text-sm text-blue-900/70 ms-7 leading-snug">
                               {batch.excelName}
                             </p>
                           ) : null}
                         </td>
-                        <td className="px-1.5 py-0.5 text-blue-900/80">
+                        <td className="px-3 py-2.5 text-blue-900/80 align-top">
                           {total}
                         </td>
-                        <td className="px-1.5 py-0.5 text-blue-900/80">
+                        <td className="px-3 py-2.5 text-blue-900/80 align-top">
                           {batch.withReportId || 0}/{total || 0}
                         </td>
-                        <td className="px-1.5 py-0.5 text-blue-900/80">
+                        <td className="px-3 py-2.5 text-blue-900/80 align-top">
                           <div className="flex flex-wrap items-center gap-2">
-                            <span className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-2 py-0.5 text-[10px] text-blue-900 border border-blue-100">
-                              <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                              {completed}/{total} done
+                            <span className="inline-flex items-center gap-2 rounded-full bg-blue-50 px-2 py-0.5 text-xs text-blue-900 border border-blue-100">
+                              <CheckCircle2 className="w-3 h-3 shrink-0 text-emerald-600" />
+                              {t("elRajhiUpload.doneProgress", {
+                                done: completed,
+                                total,
+                              })}
                             </span>
                             {sent ? (
-                              <span className="inline-flex items-center gap-2 rounded-full bg-white px-2 py-0.5 text-[10px] text-blue-700 border border-blue-100">
-                                <Send className="w-3 h-3" />
-                                {sent} sent
+                              <span className="inline-flex items-center gap-2 rounded-full bg-white px-2 py-0.5 text-xs text-blue-700 border border-blue-100">
+                                <Send className="w-3 h-3 shrink-0" />
+                                {t("elRajhiUpload.sentCount", { n: sent })}
                               </span>
                             ) : null}
                             {confirmed ? (
-                              <span className="inline-flex items-center gap-2 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] text-emerald-700 border border-emerald-100">
-                                <CheckCircle2 className="w-3 h-3" />
-                                {confirmed} confirmed
+                              <span className="inline-flex items-center gap-2 rounded-full bg-emerald-50 px-2 py-0.5 text-xs text-emerald-700 border border-emerald-100">
+                                <CheckCircle2 className="w-3 h-3 shrink-0" />
+                                {t("elRajhiUpload.confirmedCount", {
+                                  n: confirmed,
+                                })}
                               </span>
                             ) : null}
                           </div>
                         </td>
-                        <td className="px-1.5 py-0.5 text-right">
-                          <div className="flex gap-1.5 justify-end items-center">
+                        <td className="px-3 py-2.5 text-right align-top">
+                          <div className="flex flex-wrap gap-2 justify-end items-center">
                             {/* Batch Actions Dropdown */}
                             <div className="relative">
                               <select
@@ -4588,24 +4659,31 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                   isCheckingThisBatch ||
                                   isRetryingThisBatch
                                 }
-                                className="px-2 py-1 border border-gray-300 rounded-md text-[10px] focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 cursor-pointer appearance-none bg-white min-w-[130px]"
+                                className="px-2.5 py-1.5 border border-gray-300 rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 cursor-pointer appearance-none bg-white min-w-[10rem]"
                               >
-                                <option value="">Select Action</option>
+                                <option value="">
+                                  {t("elRajhiUpload.actionSelectPlaceholder")}
+                                </option>
                                 <option value="check-status">
-                                  Check Status
+                                  {t("elRajhiUpload.actionCheckStatus")}
+                                </option>
+                                <option value="send-to-approver">
+                                  {t("elRajhiUpload.bulkSendApprover")}
                                 </option>
                                 <option value="approve-reports">
-                                  Approve Reports
+                                  {t("elRajhiUpload.actionApproveReports")}
                                 </option>
                                 <option value="download-certificates">
-                                  Download Certificates
+                                  {t("elRajhiUpload.actionDownloadCertificates")}
                                 </option>
-                                <option value="retry-batch">Retry Batch</option>
+                                <option value="retry-batch">
+                                  {t("elRajhiUpload.actionRetryBatch")}
+                                </option>
                               </select>
 
                               {/* Dropdown arrow */}
-                              <div className="absolute inset-y-0 right-0 flex items-center pr-1 pointer-events-none">
-                                <ChevronDown className="w-3 h-3 text-gray-400" />
+                              <div className="absolute inset-y-0 right-0 flex items-center pr-2 pointer-events-none">
+                                <ChevronDown className="w-4 h-4 text-gray-400" />
                               </div>
                             </div>
 
@@ -4624,12 +4702,12 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                 isCheckingThisBatch ||
                                 isRetryingThisBatch
                               }
-                              className="px-2 py-1 bg-blue-600 text-white text-[10px] font-semibold rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed min-w-[40px]"
+                              className="px-2.5 py-1.5 bg-blue-600 text-white text-xs font-semibold rounded-md hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed min-w-[2.75rem]"
                             >
                               {batchActionLoading[batch.batchId] ? (
                                 <Loader2 className="w-3 h-3 animate-spin mx-auto" />
                               ) : (
-                                "Go"
+                                t("elRajhiUpload.go")
                               )}
                             </button>
 
@@ -4655,40 +4733,57 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                       {isExpanded && (
                         <tr className="border-b border-blue-900/10 last:border-0">
                           <td colSpan={6} className="bg-blue-50/40">
-                            <div className="p-2">
+                            <div className="p-3 sm:p-4">
                               {hasReportsData ? (
-                                <div className="overflow-x-auto rounded-xl border border-blue-900/15 bg-white mt-[3px] mb-[3px]">
-                                  <div className="px-2 py-2 text-[11px] font-semibold text-blue-900 flex items-center gap-2">
-                                    <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-blue-100 text-blue-700 text-[10px] font-bold">
+                                <div className="overflow-x-auto rounded-xl border border-blue-900/15 bg-white my-1">
+                                  <div className="px-3 py-2.5 text-sm font-semibold text-blue-900 flex items-center gap-2.5">
+                                    <span className="inline-flex items-center justify-center min-w-[1.75rem] h-7 px-1.5 rounded-full bg-blue-100 text-blue-800 text-xs font-bold">
                                       {filteredReports.length}
                                     </span>
-                                    Reports
+                                    {t("elRajhiUpload.reportsSectionTitle")}
                                   </div>
-                                  <table className="min-w-full text-[10px] leading-tight">
-                                    <thead className="bg-blue-900/95 text-white/90">
-                                      <tr>
-                                        <th className="px-2 py-1 text-left">
-                                          Report
+                                  <table className="batch-nested-table min-w-full text-sm leading-relaxed">
+                                    <colgroup>
+                                      <col style={{ width: "11%" }} />
+                                      <col style={{ width: "17%" }} />
+                                      <col style={{ width: "24%" }} />
+                                      <col style={{ width: "15%" }} />
+                                      <col style={{ width: "14%" }} />
+                                      <col style={{ width: "19%" }} />
+                                    </colgroup>
+                                    <thead>
+                                      <tr className="bg-blue-900/95 text-white/90">
+                                        <th className="px-3 py-2 text-left font-semibold border-b border-white/10 align-bottom">
+                                          {t("elRajhiUpload.colReport")}
                                         </th>
-                                        <th className="px-2 py-1 text-left">
-                                          Client
+                                        <th className="px-3 py-2 text-left font-semibold border-b border-white/10 align-bottom">
+                                          {t("elRajhiUpload.colClient")}
                                         </th>
-                                        <th className="px-2 py-1 text-left">
-                                          Asset
+                                        <th className="px-3 py-2 text-left font-semibold border-b border-white/10 align-bottom">
+                                          {t("elRajhiUpload.colAsset")}
                                         </th>
-                                        <th className="px-2 py-1 text-left">
-                                          Status
+                                        <th className="px-3 py-2 text-left font-semibold border-b border-white/10 align-bottom">
+                                          {t("elRajhiUpload.colStatus")}
                                         </th>
-                                        <th className="px-2 py-1 text-left">
-                                          Certificate
+                                        <th className="px-3 py-2 text-left font-semibold border-b border-white/10 align-bottom">
+                                          {t("elRajhiUpload.colCertificate")}
                                         </th>
-                                        <th className="px-2 py-1 text-left">
-                                          <div className="flex items-center gap-2 flex-wrap justify-between w-full">
-                                            <div className="flex items-center gap-2 flex-wrap">
-                                              <div className="flex items-center gap-2 bg-white/10 rounded-md px-2 py-1">
+                                        <th className="px-3 py-2 text-left font-semibold border-b border-white/10 align-bottom">
+                                          {t("elRajhiUpload.colActions")}
+                                        </th>
+                                      </tr>
+                                      <tr className="bg-blue-950/90 text-white/95">
+                                        <th
+                                          colSpan={6}
+                                          scope="colgroup"
+                                          className="px-3 py-2 text-left font-normal border-b border-white/10"
+                                        >
+                                          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 justify-between">
+                                            <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
+                                              <div className="inline-flex items-center gap-2 rounded-md bg-white/10 px-2 py-1">
                                                 <input
                                                   type="checkbox"
-                                                  className="h-3.5 w-3.5"
+                                                  className="h-3.5 w-3.5 shrink-0"
                                                   checked={
                                                     selectableReports.length
                                                       ? selectableReports.every(
@@ -4706,7 +4801,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                     ) {
                                                       setBatchMessage({
                                                         type: "info",
-                                                        text: requirePdfMessage,
+                                                        text: t(
+                                                          "elRajhiUpload.requirePdfFirst",
+                                                        ),
                                                       });
                                                       return;
                                                     }
@@ -4717,8 +4814,8 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                     );
                                                   }}
                                                 />
-                                                <span className="text-[10px] font-semibold text-white/90">
-                                                  Select all
+                                                <span className="text-xs font-semibold text-white/90">
+                                                  {t("elRajhiUpload.selectAll")}
                                                 </span>
                                               </div>
                                               <select
@@ -4738,31 +4835,43 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                     }),
                                                   );
                                                 }}
-                                                className="px-2 py-1 text-black border border-gray-200 rounded-md text-[10px] focus:outline-none focus:ring-1 focus:ring-blue-200 focus:border-blue-200 cursor-pointer appearance-none bg-white min-w-[110px]"
+                                                className="px-2 py-1.5 text-black border border-gray-200 rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-200 cursor-pointer appearance-none bg-white min-w-[9rem]"
                                               >
                                                 <option value="">
-                                                  All statuses
+                                                  {t(
+                                                    "elRajhiUpload.filterAllStatuses",
+                                                  )}
                                                 </option>
                                                 <option value="MISSING_ID">
-                                                  Missing ID
+                                                  {t(
+                                                    "elRajhiUpload.filterMissingId",
+                                                  )}
                                                 </option>
                                                 <option value="INCOMPLETE">
-                                                  Incomplete
+                                                  {t(
+                                                    "elRajhiUpload.filterIncomplete",
+                                                  )}
                                                 </option>
                                                 <option value="COMPLETE">
-                                                  Complete
+                                                  {t(
+                                                    "elRajhiUpload.filterComplete",
+                                                  )}
                                                 </option>
                                                 <option value="SENT">
-                                                  Sent
+                                                  {t("elRajhiUpload.filterSent")}
                                                 </option>
                                                 <option value="CONFIRMED">
-                                                  Confirmed
+                                                  {t(
+                                                    "elRajhiUpload.filterConfirmed",
+                                                  )}
                                                 </option>
                                                 <option value="DELETED">
-                                                  Deleted
+                                                  {t(
+                                                    "elRajhiUpload.filterDeleted",
+                                                  )}
                                                 </option>
                                               </select>
-                                              <div className="flex items-center gap-1 bg-white/10 rounded-md px-2 py-1">
+                                              <div className="inline-flex items-center gap-1.5 rounded-md bg-white/10 px-2 py-1">
                                                 <div className="relative">
                                                   <select
                                                     value={
@@ -4780,30 +4889,32 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                       );
                                                     }}
                                                     disabled={bulkActionBusy}
-                                                    className="px-2 py-1 text-black border border-gray-200 rounded-md text-[10px] focus:outline-none focus:ring-1 focus:ring-blue-200 focus:border-blue-200 cursor-pointer appearance-none bg-white min-w-[120px]"
+                                                    className="px-2 py-1.5 text-black border border-gray-200 rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-200 cursor-pointer appearance-none bg-white min-w-[10rem]"
                                                   >
                                                     <option value="">
-                                                      Select Bulk Action
+                                                      {t(
+                                                        "elRajhiUpload.selectBulkAction",
+                                                      )}
                                                     </option>
                                                     <option value="retry-submit">
-                                                      Retry Submit
+                                                      {t(
+                                                        "elRajhiUpload.bulkRetrySubmit",
+                                                      )}
                                                     </option>
                                                     <option value="delete">
-                                                      Delete Reports
+                                                      {t(
+                                                        "elRajhiUpload.bulkDelete",
+                                                      )}
                                                     </option>
                                                     {/* <option value="retry">Retry</option> */}
-                                                    <option value="send">
-                                                      Send to Approver
-                                                    </option>
-                                                    <option value="approve">
-                                                      Approve
-                                                    </option>
                                                     <option value="certificate">
-                                                      Download Certificate
+                                                      {t(
+                                                        "elRajhiUpload.bulkDownloadCert",
+                                                      )}
                                                     </option>
                                                   </select>
-                                                  <div className="absolute inset-y-0 right-0 flex items-center pr-1 pointer-events-none">
-                                                    <ChevronDown className="w-3 h-3 text-gray-400" />
+                                                  <div className="absolute inset-y-0 right-0 flex items-center pr-1.5 pointer-events-none">
+                                                    <ChevronDown className="w-3.5 h-3.5 text-gray-400" />
                                                   </div>
                                                 </div>
                                                 <button
@@ -4837,15 +4948,17 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                   }
                                                   title={
                                                     !hasSelection
-                                                      ? "Select at least one report first."
+                                                      ? t(
+                                                          "elRajhiUpload.selectOneFirst",
+                                                        )
                                                       : undefined
                                                   }
-                                                  className={`px-2 py-1 bg-white text-blue-700 border border-blue-200 text-[10px] font-semibold rounded-md hover:bg-blue-50 disabled:opacity-50 disabled:cursor-not-allowed min-w-[38px] ${!hasSelection ? "opacity-50" : ""}`}
+                                                  className={`px-2.5 py-1.5 bg-white text-blue-700 border border-blue-200 text-xs font-semibold rounded-md hover:bg-blue-50 disabled:opacity-50 disabled:cursor-not-allowed min-w-[2.5rem] ${!hasSelection ? "opacity-50" : ""}`}
                                                 >
                                                   {bulkActionBusy ? (
                                                     <Loader2 className="w-3 h-3 animate-spin mx-auto" />
                                                   ) : (
-                                                    "Go"
+                                                    t("elRajhiUpload.go")
                                                   )}
                                                 </button>
                                                 {showBulkActionControls && (
@@ -4879,7 +4992,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                               </div>
                                             </div>
                                             {showHeaderProgress && (
-                                              <div className="flex items-center gap-2 ml-auto min-w-[160px]">
+                                              <div className="flex items-center gap-2 min-w-[160px] max-w-[220px] shrink-0">
                                                 <div className="h-2 flex-1 bg-white/20 rounded-full overflow-hidden">
                                                   <div
                                                     className="h-full bg-emerald-300 transition-all duration-500"
@@ -4888,7 +5001,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                     }}
                                                   ></div>
                                                 </div>
-                                                <span className="text-[10px] font-semibold text-white/90">
+                                                <span className="text-xs font-semibold text-white/90 tabular-nums whitespace-nowrap">
                                                   {batchProgressValue}%
                                                 </span>
                                               </div>
@@ -4928,81 +5041,91 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                               reportId ||
                                               report.asset_name
                                             }
-                                            className="border-t last:border-0"
+                                            className="border-t border-slate-100 last:border-0"
                                           >
-                                            <td className="px-2.5 py-1.5 text-gray-900 font-semibold">
+                                            <td className="px-3 py-2 text-gray-900 font-semibold align-top">
                                               {reportId || (
-                                                <span className="text-gray-500">
-                                                  Not created
+                                                <span className="text-gray-500 font-normal">
+                                                  {t("elRajhiUpload.notCreated")}
                                                 </span>
                                               )}
                                             </td>
-                                            <td className="px-2.5 py-1.5 text-gray-800">
+                                            <td className="px-3 py-2 text-gray-800 align-top">
                                               {report.client_name || "—"}
                                             </td>
-                                            <td className="px-2.5 py-1.5 text-gray-800">
+                                            <td className="px-3 py-2 text-gray-800 align-top">
                                               {report.asset_name || "—"}
                                             </td>
-                                            <td className="px-2.5 py-1.5">
-                                              {/* Status display remains the same */}
-                                              <div className="flex flex-col gap-1">
+                                            <td className="px-3 py-2 align-top">
+                                              <div className="flex flex-col gap-1.5">
                                                 {status === "COMPLETE" ? (
-                                                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-emerald-700 border border-emerald-100 text-xs">
-                                                    <CheckCircle2 className="w-3 h-3" />
-                                                    Complete
+                                                  <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2 py-1 text-emerald-800 border border-emerald-100 text-xs">
+                                                    <CheckCircle2 className="w-3 h-3 shrink-0" />
+                                                    {t(
+                                                      "elRajhiUpload.statusComplete",
+                                                    )}
                                                   </span>
                                                 ) : status === "DELETED" ? (
-                                                  <span className="inline-flex items-center gap-1 rounded-full bg-red-50 px-2 py-1 text-red-700 border border-red-100 text-xs">
-                                                    <Trash2 className="w-3 h-3" />
-                                                    Deleted
+                                                  <span className="inline-flex items-center gap-1.5 rounded-full bg-red-50 px-2 py-1 text-red-800 border border-red-100 text-xs">
+                                                    <Trash2 className="w-3 h-3 shrink-0" />
+                                                    {t(
+                                                      "elRajhiUpload.statusDeleted",
+                                                    )}
                                                   </span>
                                                 ) : status === "SENT" ? (
-                                                  <span className="inline-flex items-center gap-1 rounded-full bg-blue-50 px-2 py-1 text-blue-700 border border-blue-100 text-xs">
-                                                    <Send className="w-3 h-3" />
-                                                    Sent
+                                                  <span className="inline-flex items-center gap-1.5 rounded-full bg-blue-50 px-2 py-1 text-blue-800 border border-blue-100 text-xs">
+                                                    <Send className="w-3 h-3 shrink-0" />
+                                                    {t(
+                                                      "elRajhiUpload.statusSent",
+                                                    )}
                                                   </span>
                                                 ) : status === "CONFIRMED" ? (
-                                                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-emerald-700 border border-emerald-100 text-xs">
-                                                    <CheckCircle2 className="w-3 h-3" />{" "}
-                                                    Confirmed
-                                                  </span>
-                                                ) : status === "CONFIRMED" ? (
-                                                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-emerald-700 border border-emerald-100 text-xs">
-                                                    <CheckCircle2 className="w-3 h-3" />
-                                                    Confirmed
+                                                  <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2 py-1 text-emerald-800 border border-emerald-100 text-xs">
+                                                    <CheckCircle2 className="w-3 h-3 shrink-0" />{" "}
+                                                    {t(
+                                                      "elRajhiUpload.statusConfirmed",
+                                                    )}
                                                   </span>
                                                 ) : status === "MISSING_ID" ? (
-                                                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-1 text-amber-700 border border-amber-100 text-xs">
-                                                    <AlertTriangle className="w-3 h-3" />
-                                                    Missing report ID
+                                                  <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-1 text-amber-800 border border-amber-100 text-xs">
+                                                    <AlertTriangle className="w-3 h-3 shrink-0" />
+                                                    {t(
+                                                      "elRajhiUpload.statusMissingReportId",
+                                                    )}
                                                   </span>
                                                 ) : (
-                                                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-1 text-amber-700 border border-amber-100 text-xs">
-                                                    <AlertTriangle className="w-3 h-3" />
-                                                    Incomplete
+                                                  <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-1 text-amber-800 border border-amber-100 text-xs">
+                                                    <AlertTriangle className="w-3 h-3 shrink-0" />
+                                                    {t(
+                                                      "elRajhiUpload.statusIncompleteShort",
+                                                    )}
                                                   </span>
                                                 )}
                                               </div>
                                             </td>
-                                            <td className="px-2.5 py-1.5">
+                                            <td className="px-3 py-2 align-top">
                                               {certificateStatus ===
                                               "downloaded" ? (
-                                                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-emerald-700 border border-emerald-100 text-xs">
-                                                  <Download className="w-3 h-3" />
-                                                  Downloaded
+                                                <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2 py-1 text-emerald-800 border border-emerald-100 text-xs">
+                                                  <Download className="w-3 h-3 shrink-0" />
+                                                  {t(
+                                                    "elRajhiUpload.certDownloaded",
+                                                  )}
                                                 </span>
                                               ) : (
-                                                <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-1 text-amber-700 border border-amber-100 text-xs">
-                                                  <AlertTriangle className="w-3 h-3" />
-                                                  Not downloaded
+                                                <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2 py-1 text-amber-800 border border-amber-100 text-xs">
+                                                  <AlertTriangle className="w-3 h-3 shrink-0" />
+                                                  {t(
+                                                    "elRajhiUpload.certNotDownloaded",
+                                                  )}
                                                 </span>
                                               )}
                                             </td>
-                                            <td className="px-2.5 py-1.5">
-                                              <div className="flex items-center gap-2">
+                                            <td className="px-3 py-2 align-top">
+                                              <div className="flex flex-wrap items-center gap-2">
                                                 <input
                                                   type="checkbox"
-                                                  className="h-4 w-4"
+                                                  className="h-3.5 w-3.5 shrink-0"
                                                   checked={isSelected(
                                                     batch.batchId,
                                                     report,
@@ -5011,7 +5134,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                     if (needsPdfBeforeActions) {
                                                       setBatchMessage({
                                                         type: "info",
-                                                        text: requirePdfMessage,
+                                                        text: t(
+                                                          "elRajhiUpload.requirePdfFirst",
+                                                        ),
                                                       });
                                                       return;
                                                     }
@@ -5026,7 +5151,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                   }
                                                   title={
                                                     needsPdfBeforeActions
-                                                      ? "Upload PDF before selecting"
+                                                      ? t(
+                                                          "elRajhiUpload.titleUploadPdfBeforeSelect",
+                                                        )
                                                       : undefined
                                                   }
                                                 />
@@ -5039,28 +5166,38 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                     });
                                                     setIsEditModalOpen(true);
                                                   }}
-                                                  className="inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-md border border-gray-300 transition-colors"
+                                                  className="inline-flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium text-gray-800 bg-gray-100 hover:bg-gray-200 rounded-md border border-gray-300 transition-colors"
                                                   title={
                                                     needsPdfBeforeActions
-                                                      ? "Upload PDF first"
-                                                      : "Edit report"
+                                                      ? t(
+                                                          "elRajhiUpload.titleUploadPdfFirst",
+                                                        )
+                                                      : t(
+                                                          "elRajhiUpload.titleEditReport",
+                                                        )
                                                   }
                                                   disabled={
                                                     needsPdfBeforeActions
                                                   }
                                                 >
-                                                  <Edit2 className="w-3 h-3" />
-                                                  Edit
+                                                  <Edit2 className="w-3 h-3 shrink-0" />
+                                                  {t("elRajhiUpload.edit")}
                                                 </button>
                                                 {showUploadPdf && (
                                                   <>
-                                                    <label className="inline-flex items-center gap-1 px-2 py-1.5 text-xs font-medium text-blue-700 bg-blue-50 border border-blue-200 rounded-md cursor-pointer hover:bg-blue-100 transition-colors">
-                                                      <FileUp className="w-3 h-3" />
+                                                    <label className="inline-flex items-center gap-1.5 px-2 py-1.5 text-xs font-medium text-blue-800 bg-blue-50 border border-blue-200 rounded-md cursor-pointer hover:bg-blue-100 transition-colors">
+                                                      <FileUp className="w-3 h-3 shrink-0" />
                                                       {pdfUploadBusy[reportKey]
-                                                        ? "Uploading..."
+                                                        ? t(
+                                                            "elRajhiUpload.uploadingPdf",
+                                                          )
                                                         : needsPdfBeforeActions
-                                                          ? "Upload PDF"
-                                                          : "Replace PDF"}
+                                                          ? t(
+                                                              "elRajhiUpload.uploadPdf",
+                                                            )
+                                                          : t(
+                                                              "elRajhiUpload.replacePdf",
+                                                            )}
                                                       <input
                                                         type="file"
                                                         accept="application/pdf"
@@ -5086,16 +5223,17 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                       />
                                                     </label>
                                                     {needsPdfBeforeActions && (
-                                                      <span className="text-[10px] text-gray-600 whitespace-nowrap">
-                                                        upload pdf file to
-                                                        update path
+                                                      <span className="text-xs text-gray-600 max-w-[14rem] leading-snug">
+                                                        {t(
+                                                          "elRajhiUpload.uploadPdfHintInline",
+                                                        )}
                                                       </span>
                                                     )}
                                                   </>
                                                 )}
                                               </div>
-                                              <div className="mt-1 w-full min-w-[160px]">
-                                                <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
+                                              <div className="mt-2 w-full min-w-[180px]">
+                                                <div className="h-2 w-full bg-slate-100 rounded-full overflow-hidden">
                                                   <div
                                                     className="h-full bg-blue-500 transition-all duration-300"
                                                     style={{
@@ -5103,7 +5241,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                     }}
                                                   ></div>
                                                 </div>
-                                                <div className="text-[9px] text-slate-500 font-semibold text-right">
+                                                <div className="text-xs text-slate-600 font-semibold text-end tabular-nums mt-0.5">
                                                   {getDisplayProgress(report)}%
                                                 </div>
                                               </div>
@@ -5115,9 +5253,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                   </table>
                                 </div>
                               ) : (
-                                <div className="flex items-center gap-2 text-xs text-gray-600">
-                                  <Loader2 className="w-4 h-4 animate-spin" />
-                                  Loading reports...
+                                <div className="flex items-center gap-2.5 p-2 text-sm text-gray-600">
+                                  <Loader2 className="w-5 h-5 animate-spin shrink-0" />
+                                  {t("elRajhiUpload.loadingReports")}
                                 </div>
                               )}
                             </div>
@@ -5129,9 +5267,12 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                 })}
               </tbody>
             </table>
-            <div className="flex items-center justify-between px-2.5 py-1.5 border-t">
-              <div className="text-xs text-gray-600">
-                Page {currentPageSafe} of {totalBatchPages}
+            <div className="flex flex-wrap items-center justify-between gap-3 px-3 py-3 border-t border-slate-200 bg-slate-50/80">
+              <div className="text-sm text-gray-700 font-medium">
+                {t("elRajhiUpload.pageOf", {
+                  current: currentPageSafe,
+                  total: totalBatchPages,
+                })}
               </div>
               {totalBatchPages > 1 &&
                 (() => {
@@ -5230,24 +5371,24 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                   const pageNumbers = getPageNumbers();
 
                   return (
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
                         onClick={() =>
                           setCurrentPage((p) => Math.max(1, p - 1))
                         }
                         disabled={currentPageSafe <= 1}
-                        className="px-3 py-1.5 text-xs rounded-md border border-slate-200 bg-white text-gray-700 disabled:opacity-50"
+                        className="px-4 py-2 text-sm font-medium rounded-lg border border-slate-200 bg-white text-gray-800 shadow-sm hover:bg-slate-50 disabled:opacity-50"
                       >
-                        Prev
+                        {t("elRajhiUpload.prev")}
                       </button>
-                      <div className="flex items-center gap-1">
+                      <div className="flex flex-wrap items-center gap-1">
                         {pageNumbers.map((page, idx) => {
                           if (page === "ellipsis") {
                             return (
                               <span
                                 key={`ellipsis-${idx}`}
-                                className="px-1.5 text-xs text-gray-600"
+                                className="px-2 text-sm text-gray-600"
                               >
                                 ...
                               </span>
@@ -5259,10 +5400,10 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                               key={page}
                               type="button"
                               onClick={() => setCurrentPage(page)}
-                              className={`min-w-[34px] px-2 py-1.5 text-xs rounded-md border ${
+                              className={`min-w-[2.5rem] px-2.5 py-2 text-sm font-medium rounded-lg border ${
                                 isActive
-                                  ? "bg-blue-600 text-white border-blue-600"
-                                  : "bg-white text-gray-700 border-slate-200 hover:bg-slate-100"
+                                  ? "bg-emerald-600 text-white border-emerald-600 shadow-sm"
+                                  : "bg-white text-gray-800 border-slate-200 hover:bg-slate-100"
                               }`}
                             >
                               {page}
@@ -5278,9 +5419,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                           )
                         }
                         disabled={currentPageSafe >= totalBatchPages}
-                        className="px-3 py-1.5 text-xs rounded-md border border-slate-200 bg-white text-gray-700 disabled:opacity-50"
+                        className="px-4 py-2 text-sm font-medium rounded-lg border border-slate-200 bg-white text-gray-800 shadow-sm hover:bg-slate-50 disabled:opacity-50"
                       >
-                        Next
+                        {t("elRajhiUpload.next")}
                       </button>
                     </div>
                   );
@@ -5288,9 +5429,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             </div>
           </div>
         ) : (
-          <div className="p-4 text-xs text-gray-600 flex items-center gap-2">
-            <Info className="w-4 h-4" />
-            No batches yet.
+          <div className="flex items-center gap-2.5 p-4 text-sm text-slate-700">
+            <Info className="h-4 w-4 shrink-0 text-slate-500" />
+            {t("elRajhiUpload.noBatches")}
           </div>
         )}
       </div>
@@ -5311,11 +5452,18 @@ const UploadReportElrajhi = ({ onViewChange }) => {
   );
 
   return (
-    <div className="p-2 space-y-2">
-      {validationModal}
-      {validationContent}
-      {checkReportsContent}
-    </div>
+    <>
+      {validationModalLayer && typeof document !== "undefined"
+        ? createPortal(validationModalLayer, document.body)
+        : null}
+      <div
+        dir={pageDir}
+        className="relative mx-auto max-w-[1400px] space-y-1.5 px-0 py-0.5 font-sans text-slate-800 antialiased"
+      >
+        {validationContent}
+        {checkReportsContent}
+      </div>
+    </>
   );
 };
 

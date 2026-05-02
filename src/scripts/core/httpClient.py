@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Any, Dict, Optional
 
 import httpx
@@ -7,9 +8,7 @@ import httpx
 # Configuration
 # ==============================
 
-# BASE_API_URL = "http://localhost:3000/api"
-
-BASE_API_URL = "http://167.71.231.64:3000/api"
+BASE_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:3000/api")
 
 # ==============================
 # Errors

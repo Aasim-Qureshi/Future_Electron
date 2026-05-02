@@ -1,11 +1,12 @@
 import React, { createContext, useContext, useState, useRef, useEffect, useCallback } from 'react';
 import { useSystemControl } from './SystemControlContext';
+import { useSession } from './SessionContext';
 
 const RamContext = createContext();
 
 const DEFAULT_TABS_PER_GB = 5;
 
-const calculateRecommendedTabs = (freeGb, tabsPerGb = DEFAULT_TABS_PER_GB) => {
+export const calculateRecommendedTabs = (freeGb, tabsPerGb = DEFAULT_TABS_PER_GB) => {
     if (freeGb == null) return 1;
 
     const perGb = Number(tabsPerGb);
@@ -31,6 +32,7 @@ export const useRam = () => {
 
 export const RamProvider = ({ children }) => {
     const { systemState } = useSystemControl();
+    const { user } = useSession();
     const [ramInfo, setRamInfo] = useState(null);
     const [readingRam, setReadingRam] = useState(false);
     const [error, setError] = useState(null);
@@ -39,8 +41,19 @@ export const RamProvider = ({ children }) => {
     const ramInFlight = useRef(false);
     const pollIntervalRef = useRef(null);
 
-    const tabsPerGbRaw = Number(systemState?.ramTabsPerGb);
-    const tabsPerGb = Number.isFinite(tabsPerGbRaw) && tabsPerGbRaw > 0 ? tabsPerGbRaw : DEFAULT_TABS_PER_GB;
+    const userTabsRaw = Number(user?.workspacePreferences?.ramTabsPerGb);
+    const systemTabsRaw = Number(systemState?.ramTabsPerGb);
+    const tabsPerGb = Number.isFinite(userTabsRaw) && userTabsRaw > 0
+        ? userTabsRaw
+        : Number.isFinite(systemTabsRaw) && systemTabsRaw > 0
+            ? systemTabsRaw
+            : DEFAULT_TABS_PER_GB;
+    const tabsPerGbSource =
+        Number.isFinite(userTabsRaw) && userTabsRaw > 0
+            ? 'user'
+            : Number.isFinite(systemTabsRaw) && systemTabsRaw > 0
+                ? 'system'
+                : 'default';
 
     const readRam = useCallback(async () => {
         if (ramInFlight.current) return;
@@ -133,7 +146,9 @@ export const RamProvider = ({ children }) => {
         readRam,
         startPolling,
         stopPolling,
-        isAvailable: !!window?.electronAPI?.readRam
+        isAvailable: !!window?.electronAPI?.readRam,
+        tabsPerGb,
+        tabsPerGbSource,
     };
 
     return <RamContext.Provider value={value}>{children}</RamContext.Provider>;

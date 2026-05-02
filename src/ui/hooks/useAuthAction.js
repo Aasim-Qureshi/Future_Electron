@@ -41,8 +41,8 @@ export const useAuthAction = () => {
         onAuthFailure = () => {},
         onViewChange = null,
         skipAuth = false,
-        /** When true, do not enqueue navigate-to-company before the action (El Rajhi / Python sets company itself). */
-        skipNavigateToCompany = false,
+        /** When true, do not enqueue navigate-to-company before the action */
+        skipNavigateToCompany = true,
       } = options;
 
       console.log("[useAuthAction] executeWithAuth called");
@@ -85,6 +85,7 @@ export const useAuthAction = () => {
             guestAccessEnabled: systemState?.guestAccessEnabled ?? true,
             cachedUser: user || null,
             selectedCompanyOfficeId,
+            disableAppAuthRedirects: true,
           },
         );
 

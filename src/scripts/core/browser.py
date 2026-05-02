@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-import profile
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -82,19 +82,30 @@ def _browser_transport_alive(browser_instance) -> bool:
 
 
 def get_profile_dir():
-    app_name = "value_tech_profile"
-
-    if sys.platform.startswith("win"):
-        base = Path(tempfile.gettempdir())
+    """
+    Persistent Chrome user-data directory so Taqeem SSO cookies survive app restarts.
+    Override with env VALUE_TECH_TAQEEM_PROFILE_DIR.
+    """
+    override = os.getenv("VALUE_TECH_TAQEEM_PROFILE_DIR", "").strip()
+    if override:
+        path = Path(override)
+    elif sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", "")
+        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        path = base / "ValueTech" / "taqeem_chrome_profile"
     elif sys.platform == "darwin":
-        base = Path(tempfile.gettempdir())
-    else:  # Linux / BSD
-        base = Path(tempfile.gettempdir())
+        path = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "ValueTech"
+            / "taqeem_chrome_profile"
+        )
+    else:
+        path = Path.home() / ".local" / "share" / "valuetech" / "taqeem_chrome_profile"
 
-    path = base / app_name
     path.mkdir(parents=True, exist_ok=True)
-    # Never print to stdout: Electron worker parses stdout as JSON lines only.
-    print(str(path), file=sys.stderr, flush=True)
+    print(str(path.resolve()), file=sys.stderr, flush=True)
     return str(path.resolve())
 
 
@@ -103,14 +114,33 @@ async def spawn_new_browser(
     user_data_dir=None,
     headless=True,
 ):
+    """
+    Start a separate Chrome process for automation.
 
+    Never reuse the live login profile directory while the primary browser still
+    holds the lock (Windows locks the entire user-data-dir). A second uc.start()
+    with the same path hangs or never opens. Use a temp profile and restore
+    session via the shared .session.dat cookie jar instead.
+    """
     profile_dir = get_profile_dir()
-    session_file = profile_dir + "/.session.dat"
+    session_file = str(Path(profile_dir) / ".session.dat")
 
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
     )
+
+    temp_profile_to_cleanup = None
+    if user_data_dir is not None and str(user_data_dir).strip():
+        isolated_user_data = str(Path(user_data_dir).resolve())
+    else:
+        temp_profile_to_cleanup = tempfile.mkdtemp(prefix="valuetech_nodriver_")
+        isolated_user_data = temp_profile_to_cleanup
+        print(
+            f"[PY] spawn_new_browser: using temp user-data-dir (avoids profile lock): {isolated_user_data}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     try:
         if old_browser:
@@ -119,21 +149,37 @@ async def spawn_new_browser(
         # If saving cookies from the old browser fails, proceed with whatever is on disk
         pass
 
-    new_browser = await uc.start(
-        user_data_dir=None,
-        headless=headless,
-        browser_args=[
-            f"--user-agent={user_agent}",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no_sandbox",
-            "--disable-popup-blocking",
-            "--disable-features=VizDisplayCompositor",
-            "--lang=en-US",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ],
-    )
+    try:
+        new_browser = await uc.start(
+            user_data_dir=isolated_user_data,
+            headless=headless,
+            browser_args=[
+                f"--user-agent={user_agent}",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no_sandbox",
+                "--disable-popup-blocking",
+                "--disable-features=VizDisplayCompositor",
+                "--lang=en-US",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+        )
+    except Exception:
+        if temp_profile_to_cleanup:
+            shutil.rmtree(temp_profile_to_cleanup, ignore_errors=True)
+        raise
+
+    if temp_profile_to_cleanup:
+        _orig_stop = new_browser.stop
+
+        def _stop_and_cleanup():
+            try:
+                return _orig_stop()
+            finally:
+                shutil.rmtree(temp_profile_to_cleanup, ignore_errors=True)
+
+        new_browser.stop = _stop_and_cleanup
 
     try:
         await new_browser.cookies.load(session_file)
@@ -174,7 +220,7 @@ async def switch_to_headless():
 
         headless_browser = await uc.start(
             headless=True,
-            user_data_dir=None,
+            user_data_dir=profile_path,
             browser_args=[
                 f"--user-agent={user_agent}",
                 "--disable-dev-shm-usage",
@@ -237,7 +283,7 @@ async def get_browser(force_new=False, headless_override=None):
 
         browser = await uc.start(
             headless=headless,
-            user_data_dir=None,
+            user_data_dir=profile_path,
             browser_args=[
                 f"--user-agent={user_agent}",
                 "--disable-dev-shm-usage",

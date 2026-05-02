@@ -1,42 +1,19 @@
-import React from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
-  AppWindow,
-  CircleDot,
-  Wrench,
-  Truck,
-  Loader2,
-  AlertCircle,
-  Home,
-  MonitorDot,
-  Settings,
-  Package,
-  BarChart3,
-  Users,
-  ShieldCheck,
   Building2,
-  Database,
-  MessageCircle,
+  ChevronRight,
+  FileSpreadsheet,
+  Loader2,
+  PanelLeftClose,
+  PanelRightClose,
+  Settings,
+  Zap,
 } from "lucide-react";
-import { useSystemControl } from "../context/SystemControlContext";
-import { useValueNav } from "../context/ValueNavContext";
-import { useSession } from "../context/SessionContext";
-import { useNavStatus } from "../context/NavStatusContext";
-import navigation from "../constants/navigation";
-import {
-  canAccessGroup,
-  filterTabsByAccess,
-  getFirstAccessibleTabId,
-  isSuperAdminUser,
-} from "../utils/viewAccess";
 import { useTranslation } from "react-i18next";
-import {
-  emitTaqeemConflict,
-  syncTaqeemSnapshot,
-} from "../../shared/helper/taqeemSync";
+import { useValueNav } from "../context/ValueNavContext";
 
-const { valueSystemGroups } = navigation;
-
-const getCompanyIdentity = (company) => {
+const getCompanySelectionKey = (company) => {
   if (!company) return "";
   return String(
     company.officeId ||
@@ -48,973 +25,457 @@ const getCompanyIdentity = (company) => {
   );
 };
 
-const Sidebar = ({ currentView, onViewChange }) => {
+/**
+ * @param {object} props
+ * @param {string} props.currentView
+ * @param {(viewId: string) => void} props.onViewChange
+ * @param {boolean} [props.showDesktopCollapse=true]
+ * @param {() => void} [props.onRequestCollapse]
+ * @param {boolean} [props.railMode=false]
+ * @param {() => void} [props.onRequestExpand]
+ */
+const Sidebar = ({
+  currentView,
+  onViewChange,
+  showDesktopCollapse = true,
+  onRequestCollapse,
+  railMode = false,
+  onRequestExpand,
+}) => {
   const { t, i18n } = useTranslation();
   const dir = i18n?.dir?.(i18n?.resolvedLanguage || i18n?.language) || "ltr";
-  const railEdgeClass = dir === "rtl" ? "right-1" : "left-1";
-  const sidebarBorderClass = dir === "rtl" ? "border-l" : "border-r";
-  const { isFeatureBlocked, isAdmin } = useSystemControl();
-  const { user, isAuthenticated, token, login } = useSession();
-  const { taqeemStatus, setTaqeemStatus, setCompanyStatus } = useNavStatus();
+  const isRtl = dir === "rtl";
   const {
-    selectedCard,
-    selectedDomain,
-    selectedCompany,
-    companies,
-    loadingCompanies,
-    companyError,
-    activeGroup,
     setActiveGroup,
     setActiveTab,
-    resetNavigation,
-    chooseCard,
-    chooseDomain,
-    ensureCompaniesLoaded,
-    autoSelectDefaultCompany,
-    replaceCompanies,
+    companies,
+    loadingCompanies,
+    selectedCompany,
     setSelectedCompany,
-    syncCompanies,
   } = useValueNav();
 
-  const isAppsActive = currentView === "apps";
-  const isSettingsActive = activeGroup === "settings";
-  const settingsBlocked = isFeatureBlocked("settings");
-  const ticketsBlocked = isFeatureBlocked("tickets");
-  const isCompanyHead =
-    user?.type === "company" || user?.role === "company-head";
-  const isUser000 = isSuperAdminUser(user);
-  const clickDelayMs = 160;
-  const delayViewChange = (nextView) => {
-    if (!onViewChange) return;
-    setTimeout(() => onViewChange(nextView), clickDelayMs);
-  };
+  const [railCompanyOpen, setRailCompanyOpen] = useState(false);
+  /** Fixed menu anchor (viewport px); menu rendered via portal on document.body */
+  const [railMenuPos, setRailMenuPos] = useState(null);
+  const railTriggerRef = useRef(null);
+  const railMenuPanelRef = useRef(null);
 
-  const domainButtons = [
-    { id: "real-estate", label: "Real Estate", icon: Home },
-    { id: "equipments", label: "Equipment", icon: Truck },
-  ];
-
-  const defaultUploadTab =
-    getFirstAccessibleTabId(valueSystemGroups.uploadReports?.tabs || [], user) ||
-    "submit-reports-quickly";
-
-  const mainLinks = [
-    { id: "uploadReports", label: "Upload Reports" },
-    ...(isUser000
-      ? [{ id: "uploadSingleReport", label: "Upload Single Report" }]
-      : []),
-    ...(isAdmin
-      ? [
-          { id: "taqeemInfo", label: "Taqeem Info" },
-        ]
-      : []),
-    { id: "deleteReport", label: "Delete Report" },
-    { id: "myReports", label: "My Reports" },
-  ];
-
-  const adminLinks = [
-    { id: "system-status", label: "System Operating Status", icon: MonitorDot },
-    { id: "system-updates", label: "System Updates", icon: Wrench },
-    { id: "admin-packages", label: "Packages", icon: Package },
-    { id: "statics", label: "Statics", icon: BarChart3 },
-  ];
-
-  const companyLinks = [
-    { id: "company-members", label: "Company Members", icon: Users },
-    { id: "company-statics", label: "Company Statics", icon: BarChart3 },
-  ];
-
-  const dashboardLinks = [
-    ...(isCompanyHead
-      ? [
-          {
-            id: "company-console",
-            label: "Company Dashboard",
-            icon: Building2,
-            groupId: "companyConsole",
-          },
-        ]
-      : []),
-    ...(isAdmin
-      ? [
-          {
-            id: "admin-console",
-            label: "Super Admin",
-            icon: ShieldCheck,
-            groupId: "adminConsole",
-          },
-        ]
-      : []),
-  ];
-
-  const goToSubmitReportsQuickly = async () => {
-    // Force the navigation state into Upload Reports -> Submit Reports Quickly
-    chooseCard("uploading-reports");
-    chooseDomain("equipments");
-    setActiveGroup("uploadReports");
-    setActiveTab(defaultUploadTab);
-    if (onViewChange) {
-      onViewChange(defaultUploadTab);
+  const computeRailMenuPosition = useCallback(() => {
+    const el = railTriggerRef.current;
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    const panelWidth = Math.min(window.innerWidth * 0.85, 288);
+    const margin = 6;
+    let left = isRtl ? rect.left - panelWidth - margin : rect.right + margin;
+    if (!isRtl && left + panelWidth > window.innerWidth - 8) {
+      left = Math.max(8, rect.left - panelWidth - margin);
     }
-
-    // Prime companies/default selection in the background
-    if (!selectedCompany) {
-      (async () => {
-        try {
-          const loadedCompanies = await ensureCompaniesLoaded("equipment");
-          await autoSelectDefaultCompany({
-            skipNavigation: true,
-            companiesList: loadedCompanies,
-          });
-        } catch (err) {
-          console.warn("Failed to prepare companies for upload reports", err);
-        }
-      })();
+    if (isRtl && left < 8) {
+      left = Math.min(window.innerWidth - panelWidth - 8, rect.right + margin);
     }
-  };
+    left = Math.max(8, Math.min(left, window.innerWidth - panelWidth - 8));
+    const top = Math.max(
+      8,
+      Math.min(rect.top, window.innerHeight - 120),
+    );
+    return { top, left };
+  }, [isRtl]);
 
-  const ensureGuestSession = async () => {
-    if (token) return token;
-    if (!window?.electronAPI?.apiRequest) return null;
-
-    try {
-      const tokenObj = await window.electronAPI.getToken?.();
-      const bearer = tokenObj?.refreshToken || tokenObj?.token;
-      const headers = bearer ? { Authorization: `Bearer ${bearer}` } : {};
-      const result = await window.electronAPI.apiRequest(
-        "POST",
-        "/api/users/guest",
-        {},
-        headers,
-      );
-      if (result?.token && result?.userId) {
-        const guestUser = result?.user || {
-          id: result.userId,
-          _id: result.userId,
-          guest: true,
-        };
-        login?.(guestUser, result.token);
-        return result.token;
-      }
-    } catch (err) {
-      console.warn(
-        "Failed to ensure guest session for Taqeem sync:",
-        err?.message || err,
-      );
+  useEffect(() => {
+    if (!railMode) {
+      setRailCompanyOpen(false);
+      setRailMenuPos(null);
     }
+  }, [railMode]);
 
-    return null;
-  };
+  useLayoutEffect(() => {
+    if (!railCompanyOpen || !railMode) return;
+    const pos = computeRailMenuPosition();
+    if (pos) setRailMenuPos(pos);
+  }, [railCompanyOpen, railMode, computeRailMenuPosition, companies?.length]);
 
-  const handleTaqeemLogin = async () => {
-    const waitForManualLogin = async (
-      timeoutMs = 180000,
-      intervalMs = 2000,
-    ) => {
-      const start = Date.now();
-      while (Date.now() - start < timeoutMs) {
-        const res = await window.electronAPI.checkStatus();
-        const statusText = String(res?.status || "").toUpperCase();
-        const loggedIn = res?.browserOpen && statusText.includes("SUCCESS");
-        const notLogged = statusText.includes("NOT_LOGGED_IN");
-        if (loggedIn) return res;
-        if (!res?.browserOpen && !notLogged) {
-          throw new Error(
-            t("sidebar.company.loginClosed", {
-              defaultValue: "Login window closed.",
-            }),
-          );
-        }
-        await new Promise((resolve) => setTimeout(resolve, intervalMs));
-      }
-      throw new Error(
-        t("sidebar.company.loginTimeout", {
-          defaultValue: "Timed out waiting for Taqeem login.",
-        }),
-      );
+  useEffect(() => {
+    if (!railCompanyOpen) return;
+    const onReposition = () => {
+      const pos = computeRailMenuPosition();
+      if (pos) setRailMenuPos(pos);
     };
+    window.addEventListener("resize", onReposition);
+    window.addEventListener("scroll", onReposition, true);
+    return () => {
+      window.removeEventListener("resize", onReposition);
+      window.removeEventListener("scroll", onReposition, true);
+    };
+  }, [railCompanyOpen, computeRailMenuPosition]);
 
-    try {
-      setTaqeemStatus(
-        "info",
-        t("sidebar.company.loginStarting", {
-          defaultValue: "Opening Taqeem login...",
-        }),
-      );
-      setCompanyStatus(
-        "info",
-        t("sidebar.company.loginPrompt", {
-          defaultValue: "Login to Taqeem to list your companies.",
-        }),
-      );
-      if (!window?.electronAPI?.openTaqeemLogin) {
-        throw new Error(
-          t("sidebar.company.loginUnavailable", {
-            defaultValue: "Login handler unavailable.",
-          }),
-        );
-      }
-      chooseDomain("equipments");
-      const loginResult = await window.electronAPI.openTaqeemLogin({
-        automationOnly: true,
-        onlyIfClosed: true,
-        navigateIfOpen: false,
-      });
-      if (loginResult?.status !== "SUCCESS") {
-        throw new Error(
-          loginResult?.error ||
-            t("sidebar.company.loginFailed", {
-              defaultValue: "Taqeem login failed.",
-            }),
-        );
-      }
+  useEffect(() => {
+    if (!railCompanyOpen) return;
+    let detach = () => {};
+    const timer = window.setTimeout(() => {
+      const close = (e) => {
+        const t = railTriggerRef.current;
+        const p = railMenuPanelRef.current;
+        if (t?.contains(e.target) || p?.contains(e.target)) return;
+        setRailCompanyOpen(false);
+        setRailMenuPos(null);
+      };
+      document.addEventListener("mousedown", close);
+      document.addEventListener("touchstart", close, { passive: true });
+      detach = () => {
+        document.removeEventListener("mousedown", close);
+        document.removeEventListener("touchstart", close);
+      };
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+      detach();
+    };
+  }, [railCompanyOpen]);
 
-      setTaqeemStatus(
-        "info",
-        t("sidebar.company.waitingForLogin", {
-          defaultValue: "Waiting for you to finish login...",
-        }),
-      );
-      await waitForManualLogin();
+  const go = (viewId) => {
+    setActiveGroup("uploadReports");
+    setActiveTab(viewId);
+    onViewChange?.(viewId);
+  };
 
-      const activeToken = await ensureGuestSession();
-      setCompanyStatus(
-        "info",
-        t("sidebar.company.fetching", {
-          defaultValue: "Fetching companies from Taqeem...",
-        }),
-      );
+  const iconNavActive = (id) => {
+    const active = currentView === id;
+    return [
+      "inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-colors",
+      active
+        ? "bg-white/16 text-white"
+        : "bg-white/6 text-slate-200 hover:bg-white/11 hover:text-white",
+    ].join(" ");
+  };
 
-      let snapshot = null;
-      if (activeToken) {
-        try {
-          snapshot = await syncTaqeemSnapshot({
-            token: activeToken,
-            cachedUser: user || null,
-          });
-        } catch (err) {
-          snapshot = null;
-        }
-      }
+  const navRowButtonClass = (id) => {
+    const active = currentView === id;
+    return [
+      "flex w-full flex-row items-center gap-2 rounded-lg px-2.5 py-2 text-start text-[12px] font-semibold transition-colors",
+      active
+        ? "bg-white/12 text-white"
+        : "text-slate-300 hover:bg-white/7 hover:text-white",
+    ].join(" ");
+  };
 
-      if (snapshot?.status === "TAQEEM_ALREADY_USED") {
-        // Server may reject linking, but the Taqeem browser session is still valid.
-        // Continue to local getCompanies so the sidebar can list offices from automation.
-        console.warn(
-          "[Sidebar] syncTaqeemSnapshot returned TAQEEM_ALREADY_USED; continuing with local company fetch.",
-          snapshot,
-        );
-        emitTaqeemConflict({
-          ...snapshot,
-          taqeemUser:
-            snapshot?.taqeemUser ||
-            user?.taqeemUser ||
-            user?.taqeem?.username ||
-            null,
-        });
-      }
-
-      if (snapshot?.user && activeToken) {
-        login?.(snapshot.user, activeToken);
-      }
-
-      setTaqeemStatus(
-        "success",
-        t("sidebar.company.loginSuccess", { defaultValue: "Taqeem login: On" }),
-      );
-
-      const snapshotCompanies = Array.isArray(snapshot?.companies)
-        ? snapshot.companies
-        : [];
-      if (snapshotCompanies.length > 0) {
-        const prepared = snapshotCompanies.map((c) => ({
-          ...c,
-          type: c.type || "equipment",
-        }));
-        await replaceCompanies(prepared, {
-          quiet: true,
-          skipNavigation: true,
-          autoSelect: true,
-        });
-        setCompanyStatus(
-          "info",
-          t("sidebar.company.selectToContinue", {
-            defaultValue: "Select a company to view main links.",
-          }),
-        );
-        return;
-      }
-
-      if (window?.electronAPI?.getCompanies) {
-        const data = await window.electronAPI.getCompanies();
-        const fetched = Array.isArray(data?.data)
-          ? data.data
-          : Array.isArray(data?.companies)
-            ? data.companies
-            : [];
-        if (fetched.length > 0) {
-          const prepared = fetched.map((c) => ({
-            ...c,
-            type: c.type || "equipment",
-          }));
-          let synced = prepared;
-          try {
-            const syncedRes = await syncCompanies(prepared, "equipment");
-            if (Array.isArray(syncedRes) && syncedRes.length > 0) {
-              synced = syncedRes;
-            }
-          } catch (err) {
-            console.warn("Failed to sync companies after Taqeem login", err);
-          }
-          await replaceCompanies(synced, {
-            quiet: true,
-            skipNavigation: true,
-            autoSelect: true,
-          });
-          setCompanyStatus(
-            "info",
-            t("sidebar.company.selectToContinue", {
-              defaultValue: "Select a company to view main links.",
-            }),
-          );
-        } else {
-          setCompanyStatus(
-            "error",
-            t("sidebar.company.empty", { defaultValue: "No companies found." }),
-          );
-        }
-      }
-    } catch (err) {
-      setTaqeemStatus(
-        "error",
-        err?.message ||
-          t("sidebar.company.loginFailed", {
-            defaultValue: "Taqeem login failed.",
-          }),
-      );
-      setCompanyStatus(
-        "error",
-        err?.message ||
-          t("sidebar.company.loginFailed", {
-            defaultValue: "Taqeem login failed.",
-          }),
-      );
-      alert(
-        err?.message ||
-          t("sidebar.company.loginFailed", {
-            defaultValue: "Taqeem login failed.",
-          }),
-      );
+  const handleCompanySelectChange = async (event) => {
+    const value = event.target.value;
+    if (!value) {
+      await setSelectedCompany(null, { skipNavigation: true });
+      return;
+    }
+    const company = (companies || []).find(
+      (c) => getCompanySelectionKey(c) === value,
+    );
+    if (company) {
+      await setSelectedCompany(company, { skipNavigation: true });
     }
   };
 
-  const renderDomains = () => {
-    if (selectedCard !== "uploading-reports") return null;
-    return (
-      <div
-        className="rounded-xl border border-slate-700/70 bg-slate-900/80 px-2.5 py-2 "
-        
-      >
-        <ul className="space-y-1">
-          {domainButtons.map((item, index) => {
-            const Icon = item.icon;
-            const isActive = selectedDomain === item.id;
-            return (
-              <li
-                key={item.id}
-              >
-                <button
-                  onClick={async () => {
-                    chooseDomain(item.id);
-                    setActiveGroup(null);
-
-                    if (item.id === "real-estate") {
-                      delayViewChange("coming-soon");
-                      return;
-                    }
-
-                    if (item.id === "equipments") {
-                      await goToSubmitReportsQuickly();
-                      return;
-                    }
-
-                    delayViewChange("apps");
-                  }}
-                  className={`group relative w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-start transition-none ${
-                    isActive
-                      ? "bg-cyan-600 text-white border border-cyan-500/70"
-                      : "bg-slate-900/80 text-slate-200 hover:bg-slate-800"
-                  }`}
-                >
-                  <span
-                    className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                      isActive
-                        ? "bg-cyan-200"
-                        : "bg-transparent group-hover:bg-cyan-300/50"
-                    }`}
-                  />
-                  <Icon className="w-3.5 h-3.5 opacity-90" />
-                  <span className="text-[11px] font-semibold">
-                    {t(`sidebar.domains.${item.id}`, {
-                      defaultValue: item.label,
-                    })}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </div>
-    );
-  };
-
-  const renderCompanyList = () => {
-    if (selectedDomain !== "equipments") return null;
-    const showPlaceholder =
-      !selectedCompany &&
-      !loadingCompanies &&
-      !companyError &&
-      (!companies || companies.length === 0);
-    const visibleCompanies = companies;
-    const hasCompanies = visibleCompanies && visibleCompanies.length > 0;
-    const showLoginPrompt =
-      !isAuthenticated || taqeemStatus?.state !== "success";
-    return (
-      <div
-        className="rounded-xl border border-slate-700/70 bg-slate-900/80 px-2.5 py-2 space-y-1.5 "
-        
-      >
-        {loadingCompanies && (
-          <div className="flex items-center gap-2 text-[10px] text-slate-100 bg-slate-900/70 border border-slate-800 rounded-md px-2 py-1">
-            <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            <span>{t("sidebar.company.loading")}</span>
-          </div>
-        )}
-        {companyError && (
-          <div className="flex items-center gap-2 text-[10px] text-amber-100 bg-amber-900/40 border border-amber-800 rounded-md px-2 py-1">
-            <AlertCircle className="w-3.5 h-3.5" />
-            <span>{companyError}</span>
-          </div>
-        )}
-        {showPlaceholder && (
-          <div className="space-y-2 bg-gradient-to-br from-slate-950/70 via-slate-900/70 to-slate-900/50 border border-slate-800 rounded-md px-2.5 py-2 ">
-            {showLoginPrompt && (
-              <>
-                <div className="flex items-start gap-2 rounded-md border border-cyan-400/20 bg-cyan-950/40 px-2.5 py-2 text-[10px] text-cyan-100">
-                  <AlertCircle className="w-3.5 h-3.5 mt-0.5 text-cyan-200" />
-                  <div className="text-[9px] font-semibold text-cyan-100">
-                    {t("sidebar.company.loginPrompt", {
-                      defaultValue: "Login to Taqeem to list your companies.",
-                    })}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleTaqeemLogin}
-                  className="w-full inline-flex items-center justify-center gap-2 rounded-md bg-emerald-600 px-3 py-2 text-[10px] font-semibold text-white shadow-[0_12px_24px_rgba(16,185,129,0.35)] hover:bg-emerald-700"
-                >
-                  {t("sidebar.company.loginButton", {
-                    defaultValue: "Login to Taqeem to get companies",
-                  })}
-                </button>
-              </>
-            )}
-            {!showLoginPrompt && (
-              <div className="text-[10px] text-slate-300">
-                {t("sidebar.company.empty")}
-              </div>
-            )}
-          </div>
-        )}
-        {hasCompanies && (
-          <ul className="space-y-1">
-            {visibleCompanies.map((company, index) => {
-              const isActive =
-                getCompanyIdentity(selectedCompany) ===
-                getCompanyIdentity(company);
-              return (
-                <li
-                  key={`${getCompanyIdentity(company) || company.name || "company"}-${index}`}
-                >
-                  <button
-                    onClick={async () => {
-                      await setSelectedCompany(company);
-                    }}
-                    className={`group relative w-full text-start px-2.5 py-1.5 rounded-md flex flex-col gap-0.5 ${
-                      isActive
-                        ? "bg-cyan-600/25 text-white shadow-[0_8px_20px_rgba(14,116,144,0.2)]"
-                        : "bg-slate-900/80 text-slate-100 hover:bg-slate-800"
-                    }`}
-                  >
-                    <span
-                      className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                        isActive
-                          ? "bg-cyan-200"
-                          : "bg-transparent group-hover:bg-cyan-300/50"
-                      }`}
-                    />
-                    <div className="text-[11px] font-semibold truncate">
-                      {company.name || t("sidebar.company.fallback")}
-                    </div>
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </div>
-    );
-  };
-
-  const renderMainLinks = () => {
-    if (selectedDomain !== "equipments") return null;
-    const hasCompanies = companies && companies.length > 0;
-    if (hasCompanies && !selectedCompany) {
-      return (
-        <div
-          className="rounded-xl border border-amber-500/40 bg-amber-900/35 px-3 py-2 text-[11px] text-amber-100 "
-          
-        >
-          {t("sidebar.company.selectToContinue", {
-            defaultValue: "Select a company to view main links.",
-          })}
-        </div>
-      );
+  const pickRailCompany = async (company) => {
+    if (!company) {
+      await setSelectedCompany(null, { skipNavigation: true });
+    } else {
+      await setSelectedCompany(company, { skipNavigation: true });
     }
-    return (
-      <div
-        className="rounded-xl border border-slate-700/70 bg-slate-900/80 px-2.5 py-2 "
-        
-      >
-        <ul className="space-y-1">
-          {mainLinks.map((item, index) => {
-            if (!canAccessGroup(item.id, user)) return null;
-            const blocked = isFeatureBlocked(item.id);
-            const isActive = activeGroup === item.id;
-            const groupTabs = filterTabsByAccess(
-              valueSystemGroups[item.id]?.tabs || [],
-              user,
-            );
-            const firstTab = groupTabs?.[0]?.id;
-            return (
-              <li
-                key={item.id}
-              >
-                <button
-                  onClick={() => {
-                    if (blocked) return;
-                    if (item.id === "uploadReports") {
-                      goToSubmitReportsQuickly();
-                      return;
-                    }
-                    setActiveGroup(item.id);
-                    // Automatically set and navigate to the first tab immediately if it exists
-                    if (firstTab) {
-                      setActiveTab(firstTab);
-                      // Navigate immediately without delay to skip intermediate apps view
-                      if (onViewChange) {
-                        onViewChange(firstTab);
-                      }
-                    } else {
-                      setActiveTab(null);
-                      delayViewChange("apps");
-                    }
-                  }}
-                  disabled={blocked}
-                  className={`group relative w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-start transition-none text-[11px] ${
-                    isActive
-                      ? "bg-cyan-600 text-white border border-cyan-500/70"
-                      : "bg-slate-900/80 text-slate-200 hover:bg-slate-800"
-                  } ${blocked ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <span
-                    className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                      isActive
-                        ? "bg-cyan-200"
-                        : "bg-transparent group-hover:bg-cyan-300/50"
-                    }`}
-                  />
-                  <span className="font-medium">
-                    {t(`navigation.groups.${item.id}.title`, {
-                      defaultValue:
-                        valueSystemGroups[item.id]?.title || item.label,
-                    })}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </div>
-    );
+    setRailCompanyOpen(false);
+    setRailMenuPos(null);
   };
 
-  const renderEvaluationSourcesLinks = () => {
-    if (selectedCard !== "evaluation-sources") return null;
-    const evaluationLinks = [
-      { id: "yalla-motor", label: "Yalla Motor", icon: Database },
-      { id: "haraj", label: "Haraj Data", icon: Database },
-      { id: "haraj-scrape", label: "Haraj Scrape Data", icon: Database },
-      { id: "haraj-data-updated", label: "Haraj Data Updated", icon: Database },
-      { id: "mobasher-data", label: "Mobasher Data", icon: Database },
-    ];
+  const selectedKey = getCompanySelectionKey(selectedCompany);
+  const CollapseIcon = isRtl ? PanelRightClose : PanelLeftClose;
+  const hasCompaniesList = !!companies && companies.length > 0;
+  const companySelectDisabled = loadingCompanies || !hasCompaniesList;
+
+  if (railMode) {
     return (
-      <div
-        className="rounded-xl border border-emerald-500/35 bg-slate-900/80 px-2.5 py-2 "
-        
+      <aside
+        className={`flex h-full w-full min-w-0 flex-col border-[#3d7dae]/50 bg-[#124665] ${
+          isRtl ? "border-s" : "border-e"
+        }`}
       >
-        <div className="px-2 pb-1 text-[9px] font-semibold uppercase tracking-wide text-emerald-200">
-          {t("sidebar.evaluationSources.title", {
-            defaultValue: "Evaluation Sources",
-          })}
-        </div>
-        <ul className="space-y-1">
-          {evaluationLinks.map((item, index) => {
-            const Icon = item.icon;
-            const blocked = isFeatureBlocked(item.id);
-            const isActive =
-              currentView === item.id ||
-              (item.id === "haraj" && currentView === "haraj-data");
-            return (
-              <li
-                key={item.id}
-              >
-                <button
-                  onClick={() => {
-                    if (blocked) return;
-                    setActiveGroup("evaluationSources");
-                    delayViewChange(item.id);
-                  }}
-                  disabled={blocked}
-                  className={`group relative w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-start transition-none text-[11px] ${
-                    isActive
-                      ? "bg-emerald-600 text-white border border-emerald-500/70"
-                      : "bg-slate-900/80 text-slate-200 hover:bg-slate-800"
-                  } ${blocked ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <span
-                    className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                      isActive
-                        ? "bg-emerald-200"
-                        : "bg-transparent group-hover:bg-emerald-300/50"
-                    }`}
-                  />
-                  <Icon className="w-3.5 h-3.5 opacity-90" />
-                  <span className="font-medium">
-                    {t(`navigation.tabs.${item.id}.label`, {
-                      defaultValue: item.label,
-                    })}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </div>
-    );
-  };
-
-  const renderAdminLinks = () => {
-    if (!isAdmin || selectedCard !== "admin-console") return null;
-    return (
-      <div
-        className="rounded-xl border border-amber-500/35 bg-slate-900/80 px-2 py-2 "
-        
-      >
-        <div className="px-2 pb-1 text-[9px] font-semibold uppercase tracking-wide text-amber-200">
-          {t("sidebar.admin.title")}
-        </div>
-        <ul className="space-y-1">
-          {adminLinks.map((item, index) => {
-            const Icon = item.icon;
-            const blocked = isFeatureBlocked(item.id);
-            const isActive = currentView === item.id;
-            return (
-              <li
-                key={item.id}
-              >
-                <button
-                  onClick={() => {
-                    if (blocked) return;
-                    delayViewChange(item.id);
-                  }}
-                  disabled={blocked}
-                  className={`group relative w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-start transition-none text-[11px] ${
-                    isActive
-                      ? "bg-amber-600 text-white border border-amber-500/70"
-                      : "bg-slate-900/80 text-slate-200 hover:bg-slate-800"
-                  } ${blocked ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <span
-                    className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                      isActive
-                        ? "bg-amber-200"
-                        : "bg-transparent group-hover:bg-amber-300/50"
-                    }`}
-                  />
-                  <Icon className="w-3.5 h-3.5 opacity-90" />
-                  <span className="font-medium">
-                    {t(`sidebar.admin.links.${item.id}`, {
-                      defaultValue: item.label,
-                    })}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </div>
-    );
-  };
-
-  const renderCompanyLinks = () => {
-    if (!isCompanyHead || selectedCard !== "company-console") return null;
-    return (
-      <div
-        className="rounded-xl border border-emerald-500/35 bg-slate-900/80 px-2 py-2 "
-        
-      >
-        <div className="px-2 pb-1 text-[9px] font-semibold uppercase tracking-wide text-emerald-200">
-          {t("sidebar.company.title")}
-        </div>
-        <ul className="space-y-1">
-          {companyLinks.map((item, index) => {
-            const Icon = item.icon;
-            const blocked = isFeatureBlocked(item.id);
-            const isActive = currentView === item.id;
-            return (
-              <li
-                key={item.id}
-              >
-                <button
-                  onClick={() => {
-                    if (blocked) return;
-                    delayViewChange(item.id);
-                  }}
-                  disabled={blocked}
-                  className={`group relative w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-start transition-none text-[11px] ${
-                    isActive
-                      ? "bg-emerald-600 text-white border border-emerald-500/70"
-                      : "bg-slate-900/80 text-slate-200 hover:bg-slate-800"
-                  } ${blocked ? "opacity-50 cursor-not-allowed" : ""}`}
-                >
-                  <span
-                    className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                      isActive
-                        ? "bg-emerald-200"
-                        : "bg-transparent group-hover:bg-emerald-300/50"
-                    }`}
-                  />
-                  <Icon className="w-3.5 h-3.5 opacity-90" />
-                  <span className="font-medium">
-                    {t(`sidebar.company.links.${item.id}`, {
-                      defaultValue: item.label,
-                    })}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      </div>
-    );
-  };
-
-  const renderDashboardLinks = () => {
-    if (dashboardLinks.length === 0) return null;
-    return (
-      <div
-        className="px-2.5 py-2"
-        
-      >
-        <div className="px-1 pb-1 text-[9px] font-semibold uppercase tracking-wide text-slate-400">
-          {t("sidebar.dashboards.title")}
-        </div>
-        <div className="space-y-1">
-          {dashboardLinks.map((item, index) => {
-            const Icon = item.icon;
-            const blocked = isFeatureBlocked(item.groupId);
-            const isActive = activeGroup === item.groupId;
-            const groupTabs = valueSystemGroups[item.groupId]?.tabs || [];
-            const firstTab = groupTabs?.[0]?.id;
-            return (
-              <button
-                key={item.id}
-                onClick={() => {
-                  if (blocked) return;
-                  chooseCard(item.id);
-                  setActiveGroup(item.groupId);
-                  if (firstTab) {
-                    setActiveTab(firstTab);
-                    if (onViewChange) onViewChange(firstTab);
-                  } else {
-                    if (setActiveTab) setActiveTab(null);
-                    delayViewChange("apps");
-                  }
-                }}
-                disabled={blocked}
-                className={`group relative w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-start transition-none text-[11px] ${
-                  isActive
-                    ? "bg-cyan-600 text-white border border-cyan-500/70"
-                    : "bg-slate-900/80 text-slate-100 hover:bg-slate-800"
-                } ${blocked ? "opacity-50 cursor-not-allowed" : ""}`}
-              >
-                <span
-                  className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                    isActive
-                      ? "bg-cyan-200"
-                      : "bg-transparent group-hover:bg-cyan-300/50"
-                  }`}
-                />
-                <Icon className="w-3.5 h-3.5 opacity-90" />
-                <span className="font-medium">
-                  {t(`sidebar.dashboards.links.${item.groupId}`, {
-                    defaultValue: item.label,
-                  })}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
-    );
-  };
-
-  return (
-    <div
-      dir={dir}
-      className={`relative w-[228px] min-w-[228px] h-screen text-white text-[11px] overflow-hidden ${sidebarBorderClass} border-slate-800 bg-slate-950`}
-    >
-      
-
-      <div className="relative flex h-full flex-col">
-        <div
-          className="px-3 py-3 border-b border-slate-800 bg-slate-950"
-          
-        >
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="h-2.5 w-2.5 rounded-full bg-cyan-400" />
-              <div>
-                <h1 className="text-[12px] font-semibold tracking-wide">
-                  {t("sidebar.brand.name")}
-                </h1>
-                <p className="text-[9px] text-slate-400 leading-tight">
-                  {t("sidebar.brand.subtitle")}
-                </p>
-              </div>
-            </div>
-            <span className="px-1.5 py-0.5 text-[9px] rounded-full border border-cyan-300/30 bg-cyan-900/40 text-cyan-100">
-              {t("sidebar.brand.status")}
-            </span>
-          </div>
-
-          <div className="mt-1.5 flex gap-1">
+        <div className="flex flex-col items-center border-b border-white/5 px-1 py-2">
+          {onRequestExpand ? (
             <button
-              onClick={() => {
-                resetNavigation();
-                chooseCard(null);
-                delayViewChange("apps");
-              }}
-              className={`flex-1 inline-flex items-center gap-2 rounded-md px-2.5 py-1.5 text-start transition-none ${
-                isAppsActive
-                  ? "bg-cyan-600 text-white border border-cyan-500/70"
-                  : "bg-slate-900/80 text-slate-100 hover:bg-slate-800"
-              }`}
+              type="button"
+              onClick={onRequestExpand}
+              title={t("sidebar.expandSidebar")}
+              aria-label={t("sidebar.expandSidebar")}
+              className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-600/30 text-white transition hover:bg-emerald-600/45"
             >
-              <AppWindow className="w-3.5 h-3.5" />
-              <div className="flex flex-col leading-tight">
-                <span className="font-semibold text-[11px]">
-                  {t("sidebar.apps.title")}
-                </span>
-                <span className="text-[9px] text-slate-300">
-                  {t("sidebar.apps.subtitle")}
-                </span>
-              </div>
+              <ChevronRight
+                className={`h-5 w-5 ${isRtl ? "rotate-180" : ""}`}
+                aria-hidden
+              />
+            </button>
+          ) : null}
+        </div>
+
+        <nav className="flex flex-1 flex-col items-center gap-2 overflow-y-auto px-1 py-2">
+          {loadingCompanies ? (
+            <Loader2 className="h-5 w-5 shrink-0 animate-spin text-emerald-300" />
+          ) : null}
+
+          {!loadingCompanies && (!companies || companies.length === 0) ? (
+            <div className="px-1 text-center">
+              <Building2
+                className="mx-auto h-6 w-6 text-amber-400/70"
+                aria-hidden
+              />
+            </div>
+          ) : null}
+
+          {!loadingCompanies && hasCompaniesList ? (
+            <div className="relative flex w-full justify-center">
+              <button
+                ref={railTriggerRef}
+                type="button"
+                disabled={companySelectDisabled}
+                onClick={() => {
+                  if (companySelectDisabled) return;
+                  setRailCompanyOpen((open) => {
+                    if (open) {
+                      setRailMenuPos(null);
+                      return false;
+                    }
+                    return true;
+                  });
+                }}
+                aria-expanded={railCompanyOpen}
+                aria-haspopup="listbox"
+                title={t("sidebar.companySelectPlaceholder")}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-lg bg-white/8 text-slate-100 transition hover:bg-white/14 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Building2 className="h-4 w-4" aria-hidden />
+              </button>
+              {railCompanyOpen &&
+              !companySelectDisabled &&
+              railMenuPos &&
+              typeof document !== "undefined"
+                ? createPortal(
+                    <div
+                      ref={railMenuPanelRef}
+                      className="fixed z-[10050] min-w-[13.5rem] max-w-[min(85vw,18rem)] overflow-hidden rounded-xl bg-[#1a5280] py-1 shadow-xl ring-1 ring-black/20"
+                      style={{
+                        top: railMenuPos.top,
+                        left: railMenuPos.left,
+                      }}
+                    >
+                      <ul role="listbox" className="max-h-[min(70vh,22rem)] overflow-y-auto py-0">
+                        <li role="none">
+                          <button
+                            type="button"
+                            role="option"
+                            aria-selected={!selectedKey}
+                            onClick={() => pickRailCompany(null)}
+                            className={`w-full px-3 py-2 text-start text-[11px] font-medium transition ${
+                              !selectedKey
+                                ? "bg-emerald-600/25 text-emerald-50"
+                                : "text-slate-200 hover:bg-white/8"
+                            }`}
+                          >
+                            {t("sidebar.companySelectPlaceholder")}
+                          </button>
+                        </li>
+                        {companies.map((company) => {
+                          const key = getCompanySelectionKey(company);
+                          const active = key === selectedKey;
+                          return (
+                            <li key={key} role="none">
+                              <button
+                                type="button"
+                                role="option"
+                                aria-selected={active}
+                                onClick={() => pickRailCompany(company)}
+                                className={`w-full px-3 py-2 text-start text-[11px] font-medium transition ${
+                                  active
+                                    ? "bg-emerald-600/25 text-emerald-50"
+                                    : "text-slate-200 hover:bg-white/8"
+                                }`}
+                              >
+                                {company.name || t("sidebar.company.fallback")}
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>,
+                    document.body,
+                  )
+                : null}
+            </div>
+          ) : null}
+
+          {selectedCompany ? (
+            <>
+              <button
+                type="button"
+                title={t("navigation.tabs.upload-report-elrajhi.label", {
+                  defaultValue: "رفع تقارير (الراجحي)",
+                })}
+                aria-label={t("navigation.tabs.upload-report-elrajhi.label", {
+                  defaultValue: "رفع تقارير (الراجحي)",
+                })}
+                className={iconNavActive("upload-report-elrajhi")}
+                onClick={() => go("upload-report-elrajhi")}
+              >
+                <FileSpreadsheet className="h-4 w-4" aria-hidden />
+              </button>
+              <button
+                type="button"
+                title={t("navigation.tabs.submit-reports-quickly.label", {
+                  defaultValue: "رفع سريع",
+                })}
+                aria-label={t("navigation.tabs.submit-reports-quickly.label", {
+                  defaultValue: "رفع سريع",
+                })}
+                className={iconNavActive("submit-reports-quickly")}
+                onClick={() => go("submit-reports-quickly")}
+              >
+                <Zap className="h-4 w-4" aria-hidden />
+              </button>
+            </>
+          ) : null}
+
+          <div className="min-h-[4px] flex-1" />
+        </nav>
+
+        <div className="border-t border-white/5 px-1 py-2">
+          <div className="flex justify-center">
+            <button
+              type="button"
+              title={t("sidebar.openSettings")}
+              aria-label={t("sidebar.openSettings")}
+              onClick={() => onViewChange?.("system-settings")}
+              className="inline-flex h-10 w-10 items-center justify-center rounded-lg bg-white/8 text-slate-100 transition hover:bg-white/14"
+            >
+              <Settings className="h-4 w-4" aria-hidden />
             </button>
           </div>
         </div>
+      </aside>
+    );
+  }
 
-        <nav className="flex-1 px-2.5 py-2 overflow-y-auto space-y-2">
-          {renderDomains()}
-          {renderCompanyList()}
-          {renderCompanyLinks()}
-          {renderAdminLinks()}
-          {renderMainLinks()}
-          {renderEvaluationSourcesLinks()}
-        </nav>
-
-        {renderDashboardLinks()}
-
-        <div
-          className="px-2.5 py-2"
-          
-        >
-          <button
-            onClick={() => {
-              if (ticketsBlocked) return;
-              setActiveGroup(null);
-              setActiveTab(null);
-              if (onViewChange) onViewChange("tickets");
-            }}
-            disabled={ticketsBlocked}
-            className={`group relative w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-start transition-none text-[11px] ${
-              currentView === "tickets"
-                ? "bg-cyan-600 text-white border border-cyan-500/70"
-                : "bg-slate-900/80 text-slate-100 hover:bg-slate-800"
-            } ${ticketsBlocked ? "opacity-50 cursor-not-allowed" : ""}`}
-          >
-            <span
-              className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                currentView === "tickets"
-                  ? "bg-cyan-200"
-                  : "bg-transparent group-hover:bg-cyan-300/50"
-              }`}
-            />
-            <MessageCircle className="w-3.5 h-3.5 opacity-90" />
-            <span className="font-medium">{t("sidebar.tickets")}</span>
-          </button>
-          <button
-            onClick={() => {
-              if (settingsBlocked) return;
-              setActiveGroup("settings");
-              const groupTabs = valueSystemGroups.settings?.tabs || [];
-              const firstTab = groupTabs?.[0]?.id;
-              if (firstTab) {
-                setActiveTab(firstTab);
-                if (onViewChange) onViewChange(firstTab);
-              } else {
-                setActiveTab(null);
-                delayViewChange("apps");
-              }
-            }}
-            disabled={settingsBlocked}
-            className={`group relative w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-start transition-none text-[11px] ${
-              isSettingsActive
-                ? "bg-cyan-600 text-white border border-cyan-500/70"
-                : "bg-slate-900/80 text-slate-100 hover:bg-slate-800"
-            } ${settingsBlocked ? "opacity-50 cursor-not-allowed" : ""}`}
-          >
-            <span
-              className={`absolute ${railEdgeClass} top-1/2 h-3.5 w-0.5 -translate-y-1/2 rounded-full ${
-                isSettingsActive
-                  ? "bg-cyan-200"
-                  : "bg-transparent group-hover:bg-cyan-300/50"
-              }`}
-            />
-            <Settings className="w-3.5 h-3.5 opacity-90" />
-            <span className="font-medium">{t("sidebar.settings")}</span>
-          </button>
+  return (
+    <aside
+      className={`flex h-full w-full min-w-0 flex-col border-[#3d7dae]/50 bg-[#124665] shadow-[2px_0_12px_rgba(0,0,0,0.1)] ${
+        isRtl ? "border-s" : "border-e"
+      }`}
+    >
+      <div className="flex items-center justify-between gap-2 border-b border-white/5 bg-[#0d3350]/92 px-3 py-2.5">
+        <div className="min-w-0 flex-1 text-[12px] font-bold leading-tight tracking-tight text-white">
+          {t("navigation.uploadRoot", { defaultValue: "رفع التقارير" })}
         </div>
-
-        <div className="px-3 py-2 border-t border-slate-800 text-[9px] text-slate-400 flex items-center gap-1.5 bg-slate-950">
-          <CircleDot className="w-3 h-3 text-emerald-400" />
-          <span>{t("sidebar.systemOnline")}</span>
-        </div>
+        {showDesktopCollapse && onRequestCollapse ? (
+          <button
+            type="button"
+            onClick={onRequestCollapse}
+            title={t("sidebar.collapseSidebar")}
+            aria-label={t("sidebar.collapseSidebar")}
+            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-200 transition hover:bg-white/10 hover:text-white"
+          >
+            <CollapseIcon className="h-4 w-4" aria-hidden />
+          </button>
+        ) : null}
       </div>
-    </div>
+
+      <nav className="flex flex-1 flex-col gap-3 overflow-y-auto overflow-x-hidden px-2.5 py-3">
+        {loadingCompanies ? (
+          <div className="flex items-center gap-2 rounded-lg bg-white/6 px-2.5 py-2 text-[11px] text-slate-300">
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-300" />
+            {t("sidebar.company.loading")}
+          </div>
+        ) : null}
+
+        {!loadingCompanies && (!companies || companies.length === 0) ? (
+          <div className="rounded-lg bg-amber-950/30 px-2.5 py-2 text-[11px] leading-snug text-amber-50">
+            {t("sidebar.company.empty")}
+          </div>
+        ) : null}
+
+        {!loadingCompanies && hasCompaniesList ? (
+          <div className="rounded-lg bg-white/[0.05] p-2.5">
+            <div className="flex flex-row items-center gap-2">
+              <Building2
+                className="h-4 w-4 shrink-0 text-emerald-300/90"
+                aria-hidden
+              />
+              <div className="relative min-w-0 flex-1">
+                <select
+                  id="sidebar-company-select"
+                  aria-label={t("sidebar.companySelectPlaceholder")}
+                  value={selectedKey}
+                  onChange={handleCompanySelectChange}
+                  className="w-full appearance-none rounded-lg bg-[#0b3554] py-2 ps-2 pe-8 text-[11px] font-semibold text-white outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-400/35"
+                >
+                  <option value="">
+                    {t("sidebar.companySelectPlaceholder")}
+                  </option>
+                  {companies.map((company) => {
+                    const key = getCompanySelectionKey(company);
+                    return (
+                      <option key={key} value={key}>
+                        {company.name || t("sidebar.company.fallback")}
+                      </option>
+                    );
+                  })}
+                </select>
+                <span className="pointer-events-none absolute inset-y-0 flex items-center pe-2 text-slate-400 end-0">
+                  <span className="text-[9px]">▾</span>
+                </span>
+              </div>
+            </div>
+            {!selectedCompany ? (
+              <p className="mt-2 text-[10px] leading-relaxed text-slate-400 ps-6">
+                {t("sidebar.selectCompanyHintShort")}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+
+        {selectedCompany ? (
+          <div className="flex flex-col gap-1 rounded-lg bg-[#0b3554]/75 p-1.5">
+            <button
+              type="button"
+              className={navRowButtonClass("upload-report-elrajhi")}
+              onClick={() => go("upload-report-elrajhi")}
+            >
+              <FileSpreadsheet className="h-4 w-4 shrink-0 opacity-95" aria-hidden />
+              <span className="min-w-0 truncate">
+                {t("navigation.tabs.upload-report-elrajhi.label", {
+                  defaultValue: "رفع تقارير (الراجحي)",
+                })}
+              </span>
+            </button>
+            <button
+              type="button"
+              className={navRowButtonClass("submit-reports-quickly")}
+              onClick={() => go("submit-reports-quickly")}
+            >
+              <Zap className="h-4 w-4 shrink-0 opacity-95" aria-hidden />
+              <span className="min-w-0 truncate">
+                {t("navigation.tabs.submit-reports-quickly.label", {
+                  defaultValue: "رفع سريع",
+                })}
+              </span>
+            </button>
+          </div>
+        ) : null}
+      </nav>
+
+      <div className="border-t border-white/5 bg-[#0c3350]/90 p-2.5">
+        <button
+          type="button"
+          onClick={() => onViewChange?.("system-settings")}
+          className="flex w-full flex-row items-center justify-center gap-2 rounded-lg bg-white/8 px-2.5 py-2 text-[11px] font-semibold text-slate-100 transition hover:bg-white/12"
+        >
+          <Settings className="h-3.5 w-3.5 text-slate-300 shrink-0" aria-hidden />
+          {t("sidebar.openSettings")}
+        </button>
+      </div>
+    </aside>
   );
 };
 
 export default Sidebar;
-

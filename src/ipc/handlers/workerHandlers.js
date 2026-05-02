@@ -5,8 +5,21 @@ const https = require("https");
 const http = require("http");
 const fs = require("fs");
 const { app } = require("electron");
+const { TAQEEM_ELECTRON_PARTITION } = require("../../shared/constants/taqeemElectronPartition");
 
 let externalWebWindow = null;
+
+function isTaqeemHost(urlString) {
+  try {
+    const u = new URL(urlString);
+    return (
+      u.hostname === "taqeem.gov.sa" ||
+      u.hostname.endsWith(".taqeem.gov.sa")
+    );
+  } catch {
+    return false;
+  }
+}
 
 const workerHandlers = {
   async handlePing() {
@@ -306,6 +319,24 @@ const workerHandlers = {
         throw new Error("URL must start with http:// or https://");
       }
 
+      const wantsTaqeemPartition = isTaqeemHost(targetUrl);
+
+      if (externalWebWindow && !externalWebWindow.isDestroyed()) {
+        const currentPart = String(
+          externalWebWindow.webContents?.session?.partition || "",
+        );
+        const hasTaqeemPartition =
+          currentPart === TAQEEM_ELECTRON_PARTITION;
+        if (wantsTaqeemPartition !== hasTaqeemPartition) {
+          try {
+            externalWebWindow.destroy();
+          } catch (_) {
+            /* ignore */
+          }
+          externalWebWindow = null;
+        }
+      }
+
       if (externalWebWindow && !externalWebWindow.isDestroyed()) {
         externalWebWindow.setTitle(title);
         await externalWebWindow.loadURL(targetUrl);
@@ -326,6 +357,9 @@ const workerHandlers = {
           nodeIntegration: false,
           contextIsolation: true,
           sandbox: true,
+          ...(wantsTaqeemPartition
+            ? { partition: TAQEEM_ELECTRON_PARTITION }
+            : {}),
         },
       });
 
