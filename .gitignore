@@ -3,9 +3,8 @@ node_modules/
 build/
 release/
 dist/
-.env
-
 __pycache__/
 *.py[cod]
 *$py.class
 .session.dat
+.env
