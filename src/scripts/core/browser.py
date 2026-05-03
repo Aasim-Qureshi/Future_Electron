@@ -17,6 +17,7 @@ load_dotenv()
 browser = None
 page = None
 refresh_task = None
+_cookie_backup_task = None
 TAQEEM_APP_PREFIX = "https://qima.taqeem.gov.sa/"
 TAQEEM_AUTH_URL_MARKERS = (
     "sso.taqeem.gov.sa/realms/rel_taqeem/login-actions/authenticate",
@@ -248,7 +249,7 @@ async def switch_to_headless():
 
 
 async def get_browser(force_new=False, headless_override=None):
-    global browser
+    global browser, _cookie_backup_task
 
     if force_new and browser:
         await closeBrowser()
@@ -297,6 +298,13 @@ async def get_browser(force_new=False, headless_override=None):
             ],
             window_size=(1920, 1080),
         )
+
+        if _cookie_backup_task is None or _cookie_backup_task.done():
+            _cookie_backup_task = asyncio.create_task(
+                _periodic_session_cookie_backup(
+                    float(os.getenv("TAQEEM_COOKIE_BACKUP_INTERVAL_MINUTES", "10") or 10)
+                )
+            )
 
     return browser
 
@@ -525,11 +533,19 @@ async def new_window(url):
 
 
 async def closeBrowser():
-    global browser, page, refresh_task
+    global browser, page, refresh_task, _cookie_backup_task
 
     if refresh_task:
         refresh_task.cancel()
         refresh_task = None
+
+    if _cookie_backup_task:
+        _cookie_backup_task.cancel()
+        try:
+            await _cookie_backup_task
+        except asyncio.CancelledError:
+            pass
+        _cookie_backup_task = None
 
     if browser:
         try:
@@ -596,6 +612,38 @@ def _is_valid_http_url(url: str) -> bool:
         return parts.scheme in ("http", "https") and bool(parts.netloc)
     except Exception:
         return False
+
+
+async def _periodic_session_cookie_backup(interval_minutes=10):
+    """
+    Periodically persist nodriver cookies to .session.dat while the primary Taqeem
+    browser is open so a crash or rare profile hiccup loses less state.
+    """
+    profile_path = get_profile_dir()
+    session_file = str(Path(profile_path) / ".session.dat")
+    interval_seconds = max(120, int(interval_minutes * 60))
+
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            b = browser
+            if not b:
+                continue
+            if not _browser_transport_alive(b):
+                continue
+            await b.cookies.save(session_file)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(
+                json.dumps(
+                    {
+                        "type": "WARN",
+                        "message": f"Periodic cookie backup failed: {e}",
+                    }
+                ),
+                flush=True,
+            )
 
 
 async def _periodic_refresh(interval_minutes=1):

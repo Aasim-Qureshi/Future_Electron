@@ -616,22 +616,31 @@ async def validate_report(cmd):
             await page.close()
 
 
-async def check_report_existence(page, report_id=None):
+async def check_report_existence(
+    page, report_id=None, *, skip_navigation=False, post_nav_sleep=3.0
+):
     ERROR_TEXT_NOT_ALLOWED = "ليس لديك صلاحية للتواجد هنا !"
     ERROR_TEXT_NOT_FOUND = "هذه الصفحة غير موجودة!"
 
     if report_id:
         url = f"https://qima.taqeem.gov.sa/report/{report_id}"
 
-        print(
-            json.dumps(
-                {"event": "navigating_to_report", "reportId": report_id, "url": url}
-            ),
-            file=sys.stderr,
-        )
+        if not skip_navigation:
+            print(
+                json.dumps(
+                    {
+                        "event": "navigating_to_report",
+                        "reportId": report_id,
+                        "url": url,
+                    }
+                ),
+                file=sys.stderr,
+            )
 
-        await page.get(url)
-        await asyncio.sleep(3)
+            await page.get(url)
+            await asyncio.sleep(float(post_nav_sleep))
+        else:
+            await asyncio.sleep(0.12)
     else:
         url = await page.evaluate("window.location.href")
 

@@ -1,4 +1,4 @@
-const { session, BrowserWindow, shell } = require('electron');
+const { session, BrowserWindow, shell, screen } = require('electron');
 const pythonAPI = require('../../services/python/PythonAPI');
 
 const { TAQEEM_ELECTRON_PARTITION } = require('../../shared/constants/taqeemElectronPartition');
@@ -10,6 +10,60 @@ let lastExternalLoginTs = 0;
 let externalLoginInFlight = false;
 let secondaryPartitionSessionWired = false;
 
+/** ~400d upper bound so refresh/session cookies are rewritten as persistent where Electron allows */
+const TAQEEM_COOKIE_MAX_EXP = () => Math.floor(Date.now() / 1000) + 400 * 24 * 60 * 60;
+
+function cookieUrlFromElectronCookie(cookie) {
+    const host = String(cookie?.domain || '').replace(/^\./, '') || 'qima.taqeem.gov.sa';
+    const pathStr = cookie?.path && String(cookie.path).startsWith('/') ? cookie.path : '/';
+    const scheme = cookie?.secure === false ? 'http' : 'https';
+    return `${scheme}://${host}${pathStr}`;
+}
+
+/**
+ * When Taqeem/Keycloak set short-lived or session cookies, re-set them with a long expirationDate
+ * so the persist: partition survives restarts without forcing re-login whenever the server omits Max-Age.
+ */
+function installTaqeemPartitionLongLivedCookies(sec) {
+    if (!sec || sec.__vtCookieExtenderInstalled) return;
+    sec.__vtCookieExtenderInstalled = true;
+    let extending = false;
+
+    sec.cookies.on('changed', async (_event, cookie, _cause, removed) => {
+        if (removed || extending || !cookie?.name) return;
+        const domain = String(cookie.domain || '');
+        if (!domain.includes('taqeem.gov.sa')) return;
+
+        const maxExp = TAQEEM_COOKIE_MAX_EXP();
+        const cur = cookie.expirationDate;
+        if (typeof cur === 'number' && cur > maxExp - 7 * 24 * 60 * 60) return;
+
+        const url = cookieUrlFromElectronCookie(cookie);
+        extending = true;
+        try {
+            const payload = {
+                url,
+                name: cookie.name,
+                value: cookie.value,
+                domain: cookie.domain,
+                path: cookie.path || '/',
+                secure: cookie.secure !== false,
+                httpOnly: cookie.httpOnly === true,
+                expirationDate: maxExp
+            };
+            const ss = cookie.sameSite;
+            if (ss === 'strict' || ss === 'lax' || ss === 'no_restriction') {
+                payload.sameSite = ss;
+            }
+            await sec.cookies.set(payload);
+        } catch (err) {
+            console.warn('[MAIN] Taqeem cookie extend failed:', cookie.name, err?.message || err);
+        } finally {
+            extending = false;
+        }
+    });
+}
+
 function wireSecondaryPartitionPersistence() {
     if (secondaryPartitionSessionWired) return;
     secondaryPartitionSessionWired = true;
@@ -17,6 +71,7 @@ function wireSecondaryPartitionPersistence() {
         const sec = session.fromPartition(SECONDARY_PARTITION);
         // persist: partition stores cookies + web storage on disk; keep cache for fewer revalidation round-trips
         sec.setCacheSize?.(200 * 1024 * 1024);
+        installTaqeemPartitionLongLivedCookies(sec);
     } catch (err) {
         console.warn('[MAIN] Taqeem secondary session prefs:', err?.message || err);
     }
@@ -57,28 +112,82 @@ function normalizeReportIds(reports = []) {
     return reportIds;
 }
 
-async function confirmSingleReport(win, reportId) {
-    const targetUrl = `https://qima.taqeem.gov.sa/report/${reportId}`;
-    try {
-        await win.loadURL(targetUrl);
-    } catch (err) {
-        return { status: 'FAILED', error: `Failed to load report ${reportId}: ${err?.message || err}` };
-    }
+function resolveApprovalFlowOpts(opts = {}) {
+    const envConc = Number(process.env.TAQEEM_APPROVAL_CONCURRENCY);
+    const envUi = Number(process.env.TAQEEM_APPROVAL_UI_DEADLINE_MS);
+    const envLoad = Number(process.env.TAQEEM_APPROVAL_LOAD_TIMEOUT_MS);
+    return {
+        loadTimeoutMs: Number(opts.loadTimeoutMs) || (Number.isFinite(envLoad) && envLoad > 0 ? envLoad : 120000),
+        uiDeadlineMs: Number(opts.uiDeadlineMs) || (Number.isFinite(envUi) && envUi > 0 ? envUi : 120000),
+        postClickDelayMs: Number(opts.postClickDelayMs) || 1600,
+        retries: Math.max(1, Number(opts.retries) || 2),
+        pollMs: Math.max(200, Number(opts.pollMs) || 650),
+        concurrency: Math.min(
+            12,
+            Math.max(1, Number(opts.concurrency) || (Number.isFinite(envConc) && envConc > 0 ? envConc : 4))
+        )
+    };
+}
 
-    const result = await win.webContents.executeJavaScript(`
+function createApprovalWorkerWindow(index, show) {
+    wireSecondaryPartitionPersistence();
+    const offset = 40 + index * 36;
+    let x;
+    let y;
+    if (show && screen) {
+        try {
+            const { width, height } = screen.getPrimaryDisplay().workArea || { width: 1280, height: 800 };
+            x = Math.min(offset, Math.max(0, width - 1040));
+            y = Math.min(offset, Math.max(0, height - 820));
+        } catch (_) {
+            x = offset;
+            y = offset;
+        }
+    }
+    return new BrowserWindow({
+        show: !!show,
+        width: 1020,
+        height: 780,
+        x,
+        y,
+        title: show ? `اعتماد تقييم (${index + 1})` : undefined,
+        webPreferences: {
+            partition: SECONDARY_PARTITION,
+            nodeIntegration: false,
+            contextIsolation: true
+        }
+    });
+}
+
+async function confirmSingleReport(win, reportId, flowOpts = {}) {
+    const {
+        loadTimeoutMs,
+        uiDeadlineMs,
+        postClickDelayMs,
+        retries,
+        pollMs
+    } = resolveApprovalFlowOpts(flowOpts);
+
+    const targetUrl = `https://qima.taqeem.gov.sa/report/${reportId}`;
+    const wc = win.webContents;
+
+    const runPageConfirm = async () => {
+        const result = await wc.executeJavaScript(`
         new Promise((resolve) => {
-            const deadline = Date.now() + 60000; // 60s to allow manual login if needed
+            const deadline = Date.now() + ${Number(uiDeadlineMs)};
+            const poll = ${Number(pollMs)};
             const attempt = () => {
                 const checkbox = document.querySelector(
-                    'input#agree, input[name="policy"], input[type="checkbox"][name*="agree"], input[type="checkbox"][id*="agree"]'
+                    'input#agree, input[name="policy"], input[type="checkbox"][name*="agree" i], input[type="checkbox"][id*="agree" i], input[type="checkbox"][name*="policy" i]'
                 );
                 const confirmBtn = document.querySelector(
-                    'input#confirm, button#confirm, input[name="confirm"], button[name="confirm"], input[type="submit"][value*="اعتماد"], button[type="submit"]'
+                    'input#confirm, button#confirm, input[name="confirm"], button[name="confirm"], input[type="submit"][value*="اعتماد" i], button[type="submit"], button.btn-primary, input[type="submit"][name*="confirm" i], a#confirm, button[id*="confirm" i]'
                 );
                 if (checkbox && confirmBtn) {
                     try {
                         checkbox.checked = true;
                         checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+                        checkbox.dispatchEvent(new Event('input', { bubbles: true }));
                         confirmBtn.disabled = false;
                         confirmBtn.removeAttribute('disabled');
                         if (typeof confirmBtn.click === 'function') {
@@ -94,20 +203,49 @@ async function confirmSingleReport(win, reportId) {
                     }
                 }
                 if (Date.now() > deadline) {
-                    resolve({ ok: false, error: 'Timeout waiting for checkbox/button (login required?)' });
+                    resolve({ ok: false, error: 'Timeout waiting for checkbox/button (login required or page still loading)' });
                     return;
                 }
-                setTimeout(attempt, 750);
+                setTimeout(attempt, poll);
             };
             attempt();
         });
     `, true);
+        await delay(postClickDelayMs);
+        return result?.ok ? { status: 'SUCCESS' } : { status: 'FAILED', error: result?.error || 'Unknown error' };
+    };
 
-    await delay(1200); // brief pause after submit
-    return result?.ok ? { status: 'SUCCESS' } : { status: 'FAILED', error: result?.error || 'Unknown error' };
+    for (let attempt = 1; attempt <= retries; attempt += 1) {
+        try {
+            await withTimeout(wc.loadURL(targetUrl), loadTimeoutMs, `loadURL report ${reportId}`);
+        } catch (err) {
+            if (attempt === retries) {
+                return { status: 'FAILED', error: `Failed to load report ${reportId}: ${err?.message || err}` };
+            }
+            await delay(600 * attempt);
+            continue;
+        }
+
+        try {
+            await waitForNavigationStable(wc, { stableMs: 900, timeoutMs: Math.min(loadTimeoutMs, 90000) });
+        } catch (_) {
+            /* continue; page script will wait for controls */
+        }
+        await delay(450);
+
+        const pageRes = await runPageConfirm();
+        if (pageRes.status === 'SUCCESS') return pageRes;
+
+        if (attempt === retries) {
+            return pageRes;
+        }
+        await delay(700 * attempt);
+    }
+
+    return { status: 'FAILED', error: 'Exhausted retries' };
 }
 
-async function confirmReportsBatch(win, reportIds = []) {
+async function confirmReportsBatch(win, reportIds = [], flowOpts = {}) {
     if (!win || win.isDestroyed()) {
         return { total: reportIds.length, succeeded: 0, failed: reportIds.length, results: reportIds.map((id) => ({ reportId: id, status: 'FAILED', error: 'Secondary window not available' })) };
     }
@@ -115,7 +253,7 @@ async function confirmReportsBatch(win, reportIds = []) {
     const results = [];
     for (const reportId of reportIds) {
         try {
-            const res = await confirmSingleReport(win, reportId);
+            const res = await confirmSingleReport(win, reportId, flowOpts);
             results.push({ reportId, status: res.status, error: res.error });
         } catch (error) {
             results.push({ reportId, status: 'FAILED', error: error.message || String(error) });
@@ -128,6 +266,79 @@ async function confirmReportsBatch(win, reportIds = []) {
         results
     };
     return summary;
+}
+
+/**
+ * Uses multiple BrowserWindow instances (parallel "tabs") sharing persist:taqeem-secondary — same session, faster throughput.
+ */
+async function confirmReportsParallelPool(loginWin, reportIds = [], poolOpts = {}) {
+    const flowOpts = resolveApprovalFlowOpts(poolOpts);
+    const { concurrency, showWorkerWindows } = poolOpts;
+    const workersCount = Math.min(
+        Math.max(1, Number(concurrency) || flowOpts.concurrency),
+        12,
+        Math.max(1, reportIds.length)
+    );
+
+    if (workersCount <= 1) {
+        const win = loginWin && !loginWin.isDestroyed() ? loginWin : createApprovalWorkerWindow(0, false);
+        const ownsWin = win !== loginWin;
+        try {
+            return await confirmReportsBatch(win, reportIds, flowOpts);
+        } finally {
+            if (ownsWin && !win.isDestroyed()) {
+                try {
+                    win.destroy();
+                } catch (_) {
+                    /* ignore */
+                }
+            }
+        }
+    }
+
+    const workers = [];
+    for (let i = 0; i < workersCount; i += 1) {
+        workers.push(createApprovalWorkerWindow(i, !!showWorkerWindows));
+    }
+
+    const shards = workers.map(() => []);
+    reportIds.forEach((id, idx) => {
+        shards[idx % workers.length].push(id);
+    });
+
+    try {
+        const partial = await Promise.all(
+            workers.map((w, idx) => confirmReportsBatch(w, shards[idx], flowOpts))
+        );
+        const byId = new Map();
+        partial.forEach((summary) => {
+            (summary.results || []).forEach((row) => {
+                byId.set(row.reportId, row);
+            });
+        });
+        const results = reportIds.map((id) => byId.get(id) || {
+            reportId: id,
+            status: 'FAILED',
+            error: 'No worker result (internal)'
+        });
+        return {
+            total: reportIds.length,
+            succeeded: results.filter((r) => r.status === 'SUCCESS').length,
+            failed: results.filter((r) => r.status !== 'SUCCESS').length,
+            results,
+            workersUsed: workersCount
+        };
+    } finally {
+        workers.forEach((w) => {
+            if (w && !w.isDestroyed()) {
+                try {
+                    w.destroy();
+                } catch (_) {
+                    /* ignore */
+                }
+            }
+        });
+    }
 }
 
 async function waitForSecondaryLogin(win, timeoutMs = 180000, intervalMs = 1500) {
@@ -688,7 +899,15 @@ const authHandlers = {
                 if (waitForLogin) {
                     await waitForSecondaryLogin(secondaryLoginWindow, loginTimeoutMs);
                 }
-                batchSummary = await confirmReportsBatch(secondaryLoginWindow, reportIds);
+                batchSummary = await confirmReportsParallelPool(secondaryLoginWindow, reportIds, {
+                    concurrency: Number(opts.approvalConcurrency) || undefined,
+                    showWorkerWindows: opts.approvalShowWorkerWindows === true,
+                    loadTimeoutMs: opts.approvalLoadTimeoutMs,
+                    uiDeadlineMs: opts.approvalUiDeadlineMs,
+                    postClickDelayMs: opts.approvalPostClickDelayMs,
+                    retries: opts.approvalRetries,
+                    pollMs: opts.approvalPollMs
+                });
             }
 
             if (closeAfterAction && secondaryLoginWindow && !secondaryLoginWindow.isDestroyed()) {
@@ -696,11 +915,15 @@ const authHandlers = {
                 secondaryLoginWindow = null;
             }
 
+            const successMessage = closeAfterAction
+                ? 'Processed Taqeem action in a separate browser window and closed it'
+                : (reportIds.length > 0
+                    ? 'Completed Taqeem report approvals; secondary browser window left open (session stays on disk).'
+                    : 'Opened Taqeem login in a separate browser window');
+
             return {
                 status: 'SUCCESS',
-                message: closeAfterAction
-                    ? 'Processed Taqeem action in a separate browser window and closed it'
-                    : 'Opened Taqeem login in a separate browser window',
+                message: successMessage,
                 batch: batchSummary
             };
         } catch (error) {

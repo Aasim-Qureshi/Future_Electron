@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -25,7 +26,7 @@ CONFIRMED_BUTTON_TEXT = "شهادة التسجيل"
 
 
 def chunk_items(items, n):
-    """Split items into n reasonably balanced chunks."""
+    """Split items into n reasonably balanced chunks (one chunk per parallel tab)."""
     n = max(1, n)
     k, m = divmod(len(items), n)
     chunks = []
@@ -74,12 +75,14 @@ async def _check_single_report(page, report):
     try:
         url = f"https://qima.taqeem.gov.sa/report/{report_id}"
         await page.get(url)
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.45)
 
         # -------------------------------
-        # NEW: report existence check
+        # Existence: skip second navigation (caller already loaded report URL).
         # -------------------------------
-        existence = await check_report_existence(page, report_id)
+        existence = await check_report_existence(
+            page, report_id, skip_navigation=True
+        )
 
         if not existence.get("exists"):
             await _mark_submit_state(report, -1, "NOT_FOUND", clear_report_id=True)
@@ -169,12 +172,48 @@ async def _check_single_report(page, report):
         }
 
 
+def _elrajhi_check_env_float(name, default):
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except ValueError:
+        return float(default)
+
+
+def _elrajhi_check_env_int(name, default, lo=1, hi=32):
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        v = int(default)
+    else:
+        try:
+            v = int(raw)
+        except ValueError:
+            v = int(default)
+    return max(lo, min(hi, v))
+
+
 async def check_elrajhi_batches(browser, batch_id=None, tabs_num=3):
-    print(
-        f"[PY] ElRajhiChecker: starting batch status check batch_id={batch_id} tabs={tabs_num}",
-        file=sys.stderr,
-        flush=True,
+    """
+    Refresh Taqeem status for reports in a batch using parallel browser tabs.
+
+    ``tabs_num`` should match the UI \"recommended tabs\" (RAM-based). Work is
+    split across that many tabs with asyncio.gather. A short stagger between
+    tab workers reduces CDP load spikes; tune via ELRAJHI_CHECK_TAB_STAGGER_SEC.
+    """
+    per_report_timeout = _elrajhi_check_env_float(
+        "ELRAJHI_CHECK_REPORT_TIMEOUT_SEC", 95.0
     )
+    pause_intra = _elrajhi_check_env_float("ELRAJHI_CHECK_BETWEEN_REPORTS_SEC", 0.08)
+    recover_timeout = _elrajhi_check_env_float(
+        "ELRAJHI_CHECK_RECOVER_NAV_TIMEOUT_SEC", 14.0
+    )
+    stagger_sec = _elrajhi_check_env_float("ELRAJHI_CHECK_TAB_STAGGER_SEC", 0.2)
+
+    max_tabs_cap = _elrajhi_check_env_int("ELRAJHI_CHECK_MAX_TABS", 16, 1, 32)
+    requested = max(1, int(tabs_num or 3))
+
     report_data = await http_get(f"/new-scripts/batch/{batch_id}")
     reports = report_data.get("reports", [])
 
@@ -185,6 +224,16 @@ async def check_elrajhi_batches(browser, batch_id=None, tabs_num=3):
             if batch_id
             else "No reports found",
         }
+
+    effective_tabs = min(len(reports), requested, max_tabs_cap)
+
+    print(
+        f"[PY] ElRajhiChecker: batch_id={batch_id} reports={len(reports)} "
+        f"parallel_tabs={effective_tabs} (requested={requested} cap={max_tabs_cap}) "
+        f"timeout={per_report_timeout}s stagger={stagger_sec}s",
+        file=sys.stderr,
+        flush=True,
+    )
 
     workflow_browser = None
     main_page = None
@@ -207,7 +256,26 @@ async def check_elrajhi_batches(browser, batch_id=None, tabs_num=3):
             flush=True,
         )
 
-        tabs = min(len(reports), tabs_num)
+        async def recover_stuck_tab(page):
+            try:
+                await asyncio.wait_for(
+                    page.get("about:blank"),
+                    timeout=recover_timeout,
+                )
+                await asyncio.sleep(0.12)
+            except Exception as err:
+                print(
+                    json.dumps(
+                        {
+                            "event": "elrajhi-check-recover",
+                            "warning": str(err) or type(err).__name__,
+                        }
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        tabs = effective_tabs
         pages = [main_page]
         try:
             extra_pages = []
@@ -226,16 +294,18 @@ async def check_elrajhi_batches(browser, batch_id=None, tabs_num=3):
             pages = [main_page]
 
         chunks = chunk_items(reports, len(pages))
-        results = []
 
-        async def process_chunk(page, chunk):
+        async def process_chunk(page, chunk, worker_index):
+            await asyncio.sleep(stagger_sec * worker_index)
+            out = []
             for rep in chunk:
                 try:
                     res = await asyncio.wait_for(
                         _check_single_report(page, rep),
-                        timeout=75.0,
+                        timeout=per_report_timeout,
                     )
                 except asyncio.TimeoutError:
+                    await recover_stuck_tab(page)
                     res = {
                         "batchId": rep.get("batch_id") or batch_id,
                         "reportId": rep.get("report_id"),
@@ -245,6 +315,7 @@ async def check_elrajhi_batches(browser, batch_id=None, tabs_num=3):
                         "asset_name": rep.get("asset_name"),
                     }
                 except Exception as err:
+                    await recover_stuck_tab(page)
                     res = {
                         "batchId": rep.get("batch_id") or batch_id,
                         "reportId": rep.get("report_id"),
@@ -254,9 +325,17 @@ async def check_elrajhi_batches(browser, batch_id=None, tabs_num=3):
                         "asset_name": rep.get("asset_name"),
                     }
                 print(json.dumps({"event": "elrajhi-check", **res}), flush=True)
-                results.append(res)
+                out.append(res)
+                await asyncio.sleep(pause_intra)
+            return out
 
-        await asyncio.gather(*(process_chunk(p, c) for p, c in zip(pages, chunks)))
+        parts = await asyncio.gather(
+            *(
+                process_chunk(p, c, i)
+                for i, (p, c) in enumerate(zip(pages, chunks))
+            )
+        )
+        results = [item for part in parts for item in part]
 
         grouped = {}
         for item in results:

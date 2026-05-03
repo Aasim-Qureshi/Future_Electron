@@ -1242,7 +1242,12 @@ const UploadReportElrajhi = ({ onViewChange }) => {
               skipBatchLookup: true,
               preferChrome: false,
               waitForLogin: true,
-              closeAfterAction: true,
+              // Keep secondary Taqeem window open so persist:taqeem-secondary stays warm; cookies remain on disk regardless.
+              closeAfterAction: false,
+              // Parallel BrowserWindows (shared session). Override with env TAQEEM_APPROVAL_CONCURRENCY.
+              approvalConcurrency: 10,
+              // Show extra cascaded windows when batch is large (same persisted session as the main secondary window).
+              approvalShowWorkerWindows: reportIds.length >= 5,
             });
 
             if (result?.status !== "SUCCESS") {
@@ -2242,7 +2247,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         try {
           const result = await window.electronAPI.checkElrajhiBatches(
             batchId || null,
-            recommendedTabs,
+            Math.max(Number(recommendedTabs) || 1, 1),
           );
           if (result?.status !== "SUCCESS") {
             throw new Error(result?.error || "Check failed");
@@ -3212,7 +3217,13 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           ? t("elRajhiUpload.bulkDelete")
           : action === "retry"
             ? t("elRajhiUpload.bulkRetryShort")
-            : t("elRajhiUpload.bulkDownloadCert");
+            : action === "send-to-approver"
+              ? t("elRajhiUpload.bulkSendApprover")
+              : action === "approve-reports"
+                ? t("elRajhiUpload.actionApproveReports")
+                : action === "download-certificates"
+                  ? t("elRajhiUpload.actionDownloadCertificates")
+                  : t("elRajhiUpload.bulkDownloadCert");
 
     // Common function for actions that require authentication
     const executeAuthenticatedAction = async (
@@ -3360,7 +3371,137 @@ const UploadReportElrajhi = ({ onViewChange }) => {
             count: selected.length,
           }),
         });
-      } else if (action === "certificate") {
+      } else if (action === "send-to-approver") {
+        const finalizeIds = Array.from(
+          new Set(
+            selected
+              .map((r) => r.report_id || r.reportId)
+              .filter((id) => id && String(id).trim() !== ""),
+          ),
+        );
+        if (!finalizeIds.length) {
+          throw new Error(t("elRajhiUpload.msgNoReportIdsForFinalize"));
+        }
+
+        await executeWithAuth(
+          async () => {
+            if (!window?.electronAPI?.finalizeMultipleReports) {
+              throw new Error(t("elRajhiUpload.desktopIntegrationUnavailable"));
+            }
+
+            setBatchMessage({
+              type: "info",
+              text: t("elRajhiUpload.msgFinalizeBatchInProgress", {
+                count: finalizeIds.length,
+              }),
+            });
+
+            const result =
+              await window.electronAPI.finalizeMultipleReports(finalizeIds);
+            if (result?.status !== "SUCCESS") {
+              throw new Error(
+                result?.error || "Finalize multiple reports failed",
+              );
+            }
+
+            await loadBatchReports(batchId);
+            await loadBatchList();
+
+            setBatchMessage({
+              type: "success",
+              text: t("elRajhiUpload.msgBulkFinalizeSuccess", {
+                count: finalizeIds.length,
+              }),
+            });
+          },
+          { token },
+          {
+            skipAuth: false,
+            requiredPoints: finalizeIds.length,
+            skipNavigateToCompany: true,
+            showInsufficientPointsModal: () =>
+              setShowInsufficientPointsModal(true),
+            onViewChange,
+            onAuthSuccess: () => {
+              console.log(
+                "Bulk send-to-approver (finalize) authentication successful",
+              );
+            },
+            onAuthFailure: (reason) => {
+              console.warn(
+                "Bulk send-to-approver authentication failed:",
+                reason,
+              );
+              if (
+                reason !== "INSUFFICIENT_POINTS" &&
+                reason !== "LOGIN_REQUIRED"
+              ) {
+                setBatchMessage({
+                  type: "error",
+                  text:
+                    reason?.message ||
+                    t("elRajhiUpload.bulkActionFailedGeneric", {
+                      action: readableAction,
+                    }),
+                });
+              }
+            },
+          },
+        );
+      } else if (action === "approve-reports") {
+        if (!window?.electronAPI?.openTaqeemLogin) {
+          throw new Error(
+            t("elRajhiUpload.desktopIntegrationUnavailable"),
+          );
+        }
+
+        setBatchMessage({
+          type: "info",
+          text: t("elRajhiUpload.msgTaqeemOpeningBatch", { batchId }),
+        });
+
+        const reportIds = buildTaqeemReportIds(selected);
+        if (!reportIds.length) {
+          throw new Error(t("elRajhiUpload.msgNoTaqeemIdsBatch", { batchId }));
+        }
+
+        const result = await window.electronAPI.openTaqeemLogin({
+          batchId,
+          reportIds,
+          skipBatchLookup: true,
+          preferChrome: false,
+          waitForLogin: true,
+          closeAfterAction: false,
+          approvalConcurrency: 10,
+          approvalShowWorkerWindows: reportIds.length >= 5,
+        });
+
+        if (result?.status !== "SUCCESS") {
+          throw new Error(result?.error || "Failed to open Taqeem login");
+        }
+
+        const summary = result?.batch;
+        const summaryText = summary
+          ? t("elRajhiUpload.msgTaqeemSummaryShort", {
+              succeeded: summary.succeeded,
+              total: summary.total,
+              failed: summary.failed,
+            })
+          : "";
+
+        setBatchMessage({
+          type: summary?.failed ? "info" : "success",
+          text: [
+            result?.message || t("elRajhiUpload.taqeemOpenedWindow"),
+            summaryText,
+            t("elRajhiUpload.msgRefreshingStatus"),
+          ]
+            .filter(Boolean)
+            .join(" "),
+        });
+
+        await runBatchCheck(batchId);
+      } else if (action === "certificate" || action === "download-certificates") {
         // Certificate download uses the primary Taqeem browser session, not the secondary approval login.
         const reportIds = selected
           .map((report) => report.report_id || report.reportId)
@@ -4907,9 +5048,19 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                                                       )}
                                                     </option>
                                                     {/* <option value="retry">Retry</option> */}
-                                                    <option value="certificate">
+                                                    <option value="send-to-approver">
                                                       {t(
-                                                        "elRajhiUpload.bulkDownloadCert",
+                                                        "elRajhiUpload.bulkSendApprover",
+                                                      )}
+                                                    </option>
+                                                    <option value="approve-reports">
+                                                      {t(
+                                                        "elRajhiUpload.actionApproveReports",
+                                                      )}
+                                                    </option>
+                                                    <option value="download-certificates">
+                                                      {t(
+                                                        "elRajhiUpload.actionDownloadCertificates",
                                                       )}
                                                     </option>
                                                   </select>
