@@ -72,6 +72,13 @@ const normalizeKey = (value) =>
     .replace(/[\W_]+/g, "");
 
 const PDF_MATCH_ASSET_NAMES_MAX = 15;
+const APPROVAL_TABS_CAP = 4;
+
+const resolveApprovalTabs = (recommendedTabs) =>
+  Math.max(
+    1,
+    Math.min(APPROVAL_TABS_CAP, Math.floor(Number(recommendedTabs) || 1)),
+  );
 
 /** Build list of asset names missing a matched PDF filename (manual upload flow). */
 const summarizeUnmatchedPdfAssets = (
@@ -1251,7 +1258,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
               skipBatchLookup: true,
               preferChrome: false,
               waitForLogin: true,
-              tabsNum: Math.max(Number(recommendedTabs) || 1, 1),
+              tabsNum: resolveApprovalTabs(recommendedTabs),
               // Keep secondary Taqeem window open so persist:taqeem-secondary stays warm; cookies remain on disk regardless.
               closeAfterAction: false,
             });
@@ -3479,7 +3486,7 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           skipBatchLookup: true,
           preferChrome: false,
           waitForLogin: true,
-          tabsNum: Math.max(Number(recommendedTabs) || 1, 1),
+          tabsNum: resolveApprovalTabs(recommendedTabs),
           closeAfterAction: false,
         });
 

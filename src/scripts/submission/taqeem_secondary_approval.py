@@ -24,6 +24,10 @@ from scripts.core.browser import get_secondary_approval_profile_dir
 QIMA_HOME = "https://qima.taqeem.gov.sa/"
 # ValueTech-Frontend/.env (same depth as taqeem_primary_credentials.py)
 _SECONDARY_ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
+DEFAULT_APPROVAL_MAX_TABS = 4
+HARD_APPROVAL_MAX_TABS = 8
+DEFAULT_APPROVAL_UI_DEADLINE_MS = 45000
+APPROVAL_EVALUATE_TIMEOUT_S = 6.0
 
 
 def chunk_items(items: list[str], n: int) -> list[list[str]]:
@@ -145,44 +149,197 @@ async def _read_href(page) -> str:
 
 
 _APPROVE_POLL_JS = r"""
-() => {
-  const checkbox = document.querySelector(
-    'input#agree, input[name="policy"], input[type="checkbox"][name*="agree" i], input[type="checkbox"][id*="agree" i]'
+(async () => {
+  const normalize = (value) => String(value || '')
+    .replace(/[\u00a0]/g, ' ')
+    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const lower = (value) => normalize(value).toLowerCase();
+  const textOf = (el) => normalize(
+    el?.innerText || el?.textContent || el?.value || el?.getAttribute?.('aria-label') || ''
   );
-  const confirmBtn = document.querySelector(
-    'input#confirm, button#confirm, input[name="confirm"], button[name="confirm"], input[type="submit"][value*="اعتماد" i], button[type="submit"], button.btn-primary'
-  );
-  if (!checkbox || !confirmBtn) return 'wait';
+  const attrText = (el) => lower([
+    el?.id,
+    el?.name,
+    el?.value,
+    el?.className,
+    el?.getAttribute?.('aria-label'),
+    el?.getAttribute?.('title'),
+  ].filter(Boolean).join(' '));
+  const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+      return false;
+    }
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const isDisabled = (el) =>
+    !el || el.disabled || el.getAttribute('aria-disabled') === 'true' || el.classList?.contains('disabled');
+  const queryAll = (selector) => {
+    try { return Array.from(document.querySelectorAll(selector)); }
+    catch (e) { return []; }
+  };
+  const firstVisible = (selector) => queryAll(selector).find(isVisible) || null;
+  const firstMatch = (selector, allowHidden = false) => {
+    const matches = queryAll(selector);
+    return matches.find(isVisible) || (allowHidden ? matches[0] || null : null);
+  };
+
+  const href = String(window.location.href || '');
+  if (!document.body) return 'wait:no_body';
+  if (href.includes('sso.taqeem.gov.sa') || href.includes('openid-connect')) {
+    return 'login:' + href.slice(0, 160);
+  }
+
+  const bodyText = normalize(document.body.innerText || '');
+  const bodyLower = bodyText.toLowerCase();
+  const alreadyApproved =
+    bodyText.includes('\u0645\u0639\u062a\u0645\u062f') ||
+    bodyLower.includes('approved') ||
+    bodyLower.includes('confirmed');
+
+  const checkboxSelectors = [
+    ['input#agree', true],
+    ['input[name="policy"]', true],
+    ['input[type="checkbox"][name*="agree" i]', true],
+    ['input[type="checkbox"][id*="agree" i]', true],
+    ['input[type="checkbox"][name*="policy" i]', true],
+    ['input[type="checkbox"][id*="policy" i]', true],
+    ['input[type="checkbox"]', false],
+  ];
+  let checkbox = null;
+  for (const [selector, allowHidden] of checkboxSelectors) {
+    checkbox = firstMatch(selector, allowHidden);
+    if (checkbox) break;
+  }
+  if (!checkbox) checkbox = queryAll('input[type="checkbox"]')[0] || null;
+
+  const scoreButton = (el) => {
+    if (!el || !isVisible(el)) return -1000;
+    const text = lower(textOf(el));
+    const data = `${attrText(el)} ${text}`;
+    let score = 0;
+    if (data.includes('\u0627\u0639\u062a\u0645\u0627\u062f')) score += 8;
+    if (data.includes('\u062a\u0623\u0643\u064a\u062f')) score += 5;
+    if (/\b(confirm|approve|approval)\b/.test(data)) score += 7;
+    if (/\bsend\b/.test(data) || data.includes('\u0625\u0631\u0633\u0627\u0644')) score += 2;
+    if (el.matches?.('#confirm, [name="confirm"], #approve, [name="approve"], #send, [name="send"]')) score += 5;
+    if (el.matches?.('button.btn-primary, input.btn-primary, a.btn-primary, button[type="submit"], input[type="submit"]')) score += 2;
+    if (isDisabled(el)) score -= 1;
+    return score;
+  };
+
+  const buttonSelectors = [
+    'input#confirm',
+    'button#confirm',
+    'a#confirm',
+    'input[name="confirm"]',
+    'button[name="confirm"]',
+    'input#approve',
+    'button#approve',
+    'input[name="approve"]',
+    'button[name="approve"]',
+    'input#send',
+    'button#send',
+    'input[name="send"]',
+    'button[name="send"]',
+    'button.btn-primary',
+    'input.btn-primary',
+    'a.btn-primary',
+    'button[type="submit"]',
+    'input[type="submit"]',
+    '[role="button"]',
+  ];
+  const buttonSet = new Set();
+  for (const selector of buttonSelectors) {
+    for (const el of queryAll(selector)) buttonSet.add(el);
+  }
+  const buttonCandidates = Array.from(buttonSet)
+    .map((el) => ({ el, score: scoreButton(el) }))
+    .sort((a, b) => b.score - a.score);
+  const confirmBtn = buttonCandidates.length && buttonCandidates[0].score > 0
+    ? buttonCandidates[0].el
+    : null;
+
+  if (!checkbox || !confirmBtn) {
+    if (alreadyApproved) return 'already';
+    return `wait:${!checkbox ? 'no_checkbox' : 'no_button'}`;
+  }
+
+  const fire = (el, type) => {
+    const opts = { bubbles: true, cancelable: true, view: window };
+    if (type.startsWith('pointer')) el.dispatchEvent(new PointerEvent(type, opts));
+    else if (type.startsWith('mouse') || type === 'click') el.dispatchEvent(new MouseEvent(type, opts));
+    else el.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+  };
+  const nativeSetChecked = (el, value) => {
+    const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked');
+    if (desc && typeof desc.set === 'function') desc.set.call(el, value);
+    else el.checked = value;
+  };
+  const clickLikeUser = (el) => {
+    try { el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); } catch (e) {}
+    try { el.focus?.({ preventScroll: true }); } catch (e) {}
+    for (const eventName of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      try { fire(el, eventName); } catch (e) {}
+    }
+    try { el.click?.(); } catch (e) {}
+  };
+
   try {
-    checkbox.checked = true;
-    checkbox.dispatchEvent(new Event('change', { bubbles: true }));
-    checkbox.dispatchEvent(new Event('input', { bubbles: true }));
+    clickLikeUser(checkbox);
+    if (!checkbox.checked) nativeSetChecked(checkbox, true);
+    fire(checkbox, 'input');
+    fire(checkbox, 'change');
+    fire(checkbox, 'blur');
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
     confirmBtn.disabled = false;
     confirmBtn.removeAttribute('disabled');
-    if (typeof confirmBtn.click === 'function') confirmBtn.click();
-    else confirmBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    confirmBtn.removeAttribute('aria-disabled');
+    clickLikeUser(confirmBtn);
     return 'ok';
   } catch (e) {
-    return 'err:' + String(e);
+    return 'err:' + (e?.message || String(e));
   }
-}
+})()
 """
 
 
 async def _poll_click_approve(page, ui_deadline_s: float, poll_s: float) -> dict:
     deadline = time.monotonic() + max(5.0, ui_deadline_s)
+    last_state = ""
     while time.monotonic() < deadline:
         try:
-            raw = await asyncio.wait_for(page.evaluate(_APPROVE_POLL_JS), timeout=25.0)
+            raw = await asyncio.wait_for(
+                page.evaluate(
+                    _APPROVE_POLL_JS,
+                    await_promise=True,
+                    return_by_value=True,
+                ),
+                timeout=APPROVAL_EVALUATE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            raw = "wait:evaluate_timeout"
         except Exception as err:
             raw = "err:" + str(err)
         if raw == "ok":
             await asyncio.sleep(0.75)
             return {"ok": True}
+        if raw == "already":
+            return {"ok": True, "already": True}
         if isinstance(raw, str) and raw.startswith("err:"):
             return {"ok": False, "error": raw[4:]}
+        if isinstance(raw, str) and raw.startswith("login:"):
+            return {"ok": False, "error": "Approval page redirected to login; complete secondary login and retry"}
+        last_state = str(raw or "")
         await asyncio.sleep(poll_s)
-    return {"ok": False, "error": "Timeout waiting for approve controls"}
+    detail = f" (last state: {last_state})" if last_state else ""
+    return {"ok": False, "error": f"Timeout waiting for approve controls{detail}"}
 
 
 async def run_secondary_approval_batch(cmd: dict) -> dict:
@@ -206,16 +363,19 @@ async def run_secondary_approval_batch(cmd: dict) -> dict:
     wait_for_login = cmd.get("waitForLogin", True) is not False
     login_timeout_ms = int(cmd.get("loginTimeoutMs") or 300000)
     load_timeout_s = max(15.0, float(cmd.get("approvalLoadTimeoutMs") or 120000) / 1000.0)
-    ui_deadline_s = max(15.0, float(cmd.get("approvalUiDeadlineMs") or 120000) / 1000.0)
+    ui_deadline_s = max(
+        10.0,
+        float(cmd.get("approvalUiDeadlineMs") or DEFAULT_APPROVAL_UI_DEADLINE_MS) / 1000.0,
+    )
     poll_s = max(0.2, float(cmd.get("approvalPollMs") or 550) / 1000.0)
 
     try:
-        tabs_cap = int(os.getenv("TAQEEM_SECONDARY_APPROVAL_MAX_TABS", "16"))
+        tabs_cap = int(os.getenv("TAQEEM_SECONDARY_APPROVAL_MAX_TABS", str(DEFAULT_APPROVAL_MAX_TABS)))
     except ValueError:
-        tabs_cap = 16
-    tabs_cap = max(1, min(32, tabs_cap))
-    requested = max(1, int(cmd.get("tabsNum") or cmd.get("tabs_num") or 4))
-    stagger_sec = float(os.getenv("TAQEEM_SECONDARY_APPROVAL_STAGGER_SEC", "0.2") or 0.2)
+        tabs_cap = DEFAULT_APPROVAL_MAX_TABS
+    tabs_cap = max(1, min(HARD_APPROVAL_MAX_TABS, tabs_cap))
+    requested = max(1, int(cmd.get("tabsNum") or cmd.get("tabs_num") or DEFAULT_APPROVAL_MAX_TABS))
+    stagger_sec = float(os.getenv("TAQEEM_SECONDARY_APPROVAL_STAGGER_SEC", "0.45") or 0.45)
 
     profile = get_secondary_approval_profile_dir()
     user_agent = (

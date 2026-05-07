@@ -6,6 +6,8 @@ const { getTaqeemSecondaryCredentials } = require('../../shared/constants/taqeem
 let secondaryLoginWindow = null;
 const SECONDARY_PARTITION = TAQEEM_ELECTRON_PARTITION;
 const TAQEEM_APP_HOME_URL = 'https://qima.taqeem.gov.sa/';
+const DEFAULT_SECONDARY_APPROVAL_MAX_TABS = 4;
+const HARD_SECONDARY_APPROVAL_MAX_TABS = 8;
 let lastExternalLoginTs = 0;
 let externalLoginInFlight = false;
 let secondaryPartitionSessionWired = false;
@@ -67,6 +69,23 @@ function normalizeReportIds(reports = []) {
         reportIds.push(reportId);
     });
     return reportIds;
+}
+
+function resolveSecondaryApprovalTabs(requestedTabs, reportCount = 1) {
+    const envCap = Number(process.env.TAQEEM_SECONDARY_APPROVAL_MAX_TABS);
+    const cap = Math.max(
+        1,
+        Math.min(
+            HARD_SECONDARY_APPROVAL_MAX_TABS,
+            Number.isFinite(envCap) && envCap > 0
+                ? Math.floor(envCap)
+                : DEFAULT_SECONDARY_APPROVAL_MAX_TABS
+        )
+    );
+    const requested = Number(requestedTabs) > 0
+        ? Math.floor(Number(requestedTabs))
+        : DEFAULT_SECONDARY_APPROVAL_MAX_TABS;
+    return Math.max(1, Math.min(cap, Math.max(1, reportCount), requested));
 }
 
 function resolveApprovalFlowOpts(opts = {}) {
@@ -657,13 +676,7 @@ const authHandlers = {
 
             // Dedicated Chrome (isolated profile) for secondary approvals — default; avoids Electron + primary conflicts.
             if (!forceElectronSecondary && reportIds.length > 0) {
-                const tabsNum = Math.max(
-                    1,
-                    Math.min(
-                        32,
-                        Number(opts.tabsNum) > 0 ? Math.floor(Number(opts.tabsNum)) : 4,
-                    ),
-                );
+                const tabsNum = resolveSecondaryApprovalTabs(opts.tabsNum, reportIds.length);
                 const wallSlots = Math.max(
                     1,
                     Math.ceil(reportIds.length / tabsNum),
