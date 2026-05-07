@@ -1,4 +1,4 @@
-const { session, BrowserWindow, shell, screen } = require('electron');
+const { session, BrowserWindow, shell } = require('electron');
 const pythonAPI = require('../../services/python/PythonAPI');
 
 const { TAQEEM_ELECTRON_PARTITION } = require('../../shared/constants/taqeemElectronPartition');
@@ -10,58 +10,16 @@ let lastExternalLoginTs = 0;
 let externalLoginInFlight = false;
 let secondaryPartitionSessionWired = false;
 
-/** ~400d upper bound so refresh/session cookies are rewritten as persistent where Electron allows */
-const TAQEEM_COOKIE_MAX_EXP = () => Math.floor(Date.now() / 1000) + 400 * 24 * 60 * 60;
-
-function cookieUrlFromElectronCookie(cookie) {
-    const host = String(cookie?.domain || '').replace(/^\./, '') || 'qima.taqeem.gov.sa';
-    const pathStr = cookie?.path && String(cookie.path).startsWith('/') ? cookie.path : '/';
-    const scheme = cookie?.secure === false ? 'http' : 'https';
-    return `${scheme}://${host}${pathStr}`;
-}
-
 /**
- * When Taqeem/Keycloak set short-lived or session cookies, re-set them with a long expirationDate
- * so the persist: partition survives restarts without forcing re-login whenever the server omits Max-Age.
+ * True when the secondary window is on the Taqeem app after auth — not mid-OAuth.
+ * Treating /keycloak/login/callback as "ready" caused approval to start during the
+ * handoff and produced ERR_TOO_MANY_REDIRECTS / blank pages.
  */
-function installTaqeemPartitionLongLivedCookies(sec) {
-    if (!sec || sec.__vtCookieExtenderInstalled) return;
-    sec.__vtCookieExtenderInstalled = true;
-    let extending = false;
-
-    sec.cookies.on('changed', async (_event, cookie, _cause, removed) => {
-        if (removed || extending || !cookie?.name) return;
-        const domain = String(cookie.domain || '');
-        if (!domain.includes('taqeem.gov.sa')) return;
-
-        const maxExp = TAQEEM_COOKIE_MAX_EXP();
-        const cur = cookie.expirationDate;
-        if (typeof cur === 'number' && cur > maxExp - 7 * 24 * 60 * 60) return;
-
-        const url = cookieUrlFromElectronCookie(cookie);
-        extending = true;
-        try {
-            const payload = {
-                url,
-                name: cookie.name,
-                value: cookie.value,
-                domain: cookie.domain,
-                path: cookie.path || '/',
-                secure: cookie.secure !== false,
-                httpOnly: cookie.httpOnly === true,
-                expirationDate: maxExp
-            };
-            const ss = cookie.sameSite;
-            if (ss === 'strict' || ss === 'lax' || ss === 'no_restriction') {
-                payload.sameSite = ss;
-            }
-            await sec.cookies.set(payload);
-        } catch (err) {
-            console.warn('[MAIN] Taqeem cookie extend failed:', cookie.name, err?.message || err);
-        } finally {
-            extending = false;
-        }
-    });
+function isSecondaryTaqeemAppReady(url) {
+    const u = String(url || '').toLowerCase();
+    if (!u.startsWith('https://qima.taqeem.gov.sa/')) return false;
+    if (u.includes('keycloak')) return false;
+    return true;
 }
 
 function wireSecondaryPartitionPersistence() {
@@ -71,7 +29,6 @@ function wireSecondaryPartitionPersistence() {
         const sec = session.fromPartition(SECONDARY_PARTITION);
         // persist: partition stores cookies + web storage on disk; keep cache for fewer revalidation round-trips
         sec.setCacheSize?.(200 * 1024 * 1024);
-        installTaqeemPartitionLongLivedCookies(sec);
     } catch (err) {
         console.warn('[MAIN] Taqeem secondary session prefs:', err?.message || err);
     }
@@ -113,7 +70,6 @@ function normalizeReportIds(reports = []) {
 }
 
 function resolveApprovalFlowOpts(opts = {}) {
-    const envConc = Number(process.env.TAQEEM_APPROVAL_CONCURRENCY);
     const envUi = Number(process.env.TAQEEM_APPROVAL_UI_DEADLINE_MS);
     const envLoad = Number(process.env.TAQEEM_APPROVAL_LOAD_TIMEOUT_MS);
     return {
@@ -121,42 +77,8 @@ function resolveApprovalFlowOpts(opts = {}) {
         uiDeadlineMs: Number(opts.uiDeadlineMs) || (Number.isFinite(envUi) && envUi > 0 ? envUi : 120000),
         postClickDelayMs: Number(opts.postClickDelayMs) || 1600,
         retries: Math.max(1, Number(opts.retries) || 2),
-        pollMs: Math.max(200, Number(opts.pollMs) || 650),
-        concurrency: Math.min(
-            12,
-            Math.max(1, Number(opts.concurrency) || (Number.isFinite(envConc) && envConc > 0 ? envConc : 4))
-        )
+        pollMs: Math.max(200, Number(opts.pollMs) || 650)
     };
-}
-
-function createApprovalWorkerWindow(index, show) {
-    wireSecondaryPartitionPersistence();
-    const offset = 40 + index * 36;
-    let x;
-    let y;
-    if (show && screen) {
-        try {
-            const { width, height } = screen.getPrimaryDisplay().workArea || { width: 1280, height: 800 };
-            x = Math.min(offset, Math.max(0, width - 1040));
-            y = Math.min(offset, Math.max(0, height - 820));
-        } catch (_) {
-            x = offset;
-            y = offset;
-        }
-    }
-    return new BrowserWindow({
-        show: !!show,
-        width: 1020,
-        height: 780,
-        x,
-        y,
-        title: show ? `اعتماد تقييم (${index + 1})` : undefined,
-        webPreferences: {
-            partition: SECONDARY_PARTITION,
-            nodeIntegration: false,
-            contextIsolation: true
-        }
-    });
 }
 
 async function confirmSingleReport(win, reportId, flowOpts = {}) {
@@ -268,87 +190,14 @@ async function confirmReportsBatch(win, reportIds = [], flowOpts = {}) {
     return summary;
 }
 
-/**
- * Uses multiple BrowserWindow instances (parallel "tabs") sharing persist:taqeem-secondary — same session, faster throughput.
- */
-async function confirmReportsParallelPool(loginWin, reportIds = [], poolOpts = {}) {
-    const flowOpts = resolveApprovalFlowOpts(poolOpts);
-    const { concurrency, showWorkerWindows } = poolOpts;
-    const workersCount = Math.min(
-        Math.max(1, Number(concurrency) || flowOpts.concurrency),
-        12,
-        Math.max(1, reportIds.length)
-    );
-
-    if (workersCount <= 1) {
-        const win = loginWin && !loginWin.isDestroyed() ? loginWin : createApprovalWorkerWindow(0, false);
-        const ownsWin = win !== loginWin;
-        try {
-            return await confirmReportsBatch(win, reportIds, flowOpts);
-        } finally {
-            if (ownsWin && !win.isDestroyed()) {
-                try {
-                    win.destroy();
-                } catch (_) {
-                    /* ignore */
-                }
-            }
-        }
-    }
-
-    const workers = [];
-    for (let i = 0; i < workersCount; i += 1) {
-        workers.push(createApprovalWorkerWindow(i, !!showWorkerWindows));
-    }
-
-    const shards = workers.map(() => []);
-    reportIds.forEach((id, idx) => {
-        shards[idx % workers.length].push(id);
-    });
-
-    try {
-        const partial = await Promise.all(
-            workers.map((w, idx) => confirmReportsBatch(w, shards[idx], flowOpts))
-        );
-        const byId = new Map();
-        partial.forEach((summary) => {
-            (summary.results || []).forEach((row) => {
-                byId.set(row.reportId, row);
-            });
-        });
-        const results = reportIds.map((id) => byId.get(id) || {
-            reportId: id,
-            status: 'FAILED',
-            error: 'No worker result (internal)'
-        });
-        return {
-            total: reportIds.length,
-            succeeded: results.filter((r) => r.status === 'SUCCESS').length,
-            failed: results.filter((r) => r.status !== 'SUCCESS').length,
-            results,
-            workersUsed: workersCount
-        };
-    } finally {
-        workers.forEach((w) => {
-            if (w && !w.isDestroyed()) {
-                try {
-                    w.destroy();
-                } catch (_) {
-                    /* ignore */
-                }
-            }
-        });
-    }
-}
-
 async function waitForSecondaryLogin(win, timeoutMs = 180000, intervalMs = 1500) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
         if (!win || win.isDestroyed()) {
             throw new Error('Secondary login window closed.');
         }
-        const currentUrl = String(win.webContents.getURL() || '').toLowerCase();
-        if (currentUrl.startsWith('https://qima.taqeem.gov.sa/')) {
+        const currentUrl = String(win.webContents.getURL() || '');
+        if (isSecondaryTaqeemAppReady(currentUrl)) {
             return true;
         }
         await delay(intervalMs);
@@ -495,7 +344,7 @@ async function loadSecondaryTaqeemSessionStart(win, loginUrl) {
     await win.loadURL(TAQEEM_APP_HOME_URL);
     let url = await waitForNavigationStable(win.webContents);
     let lower = url.toLowerCase();
-    if (lower.startsWith('https://qima.taqeem.gov.sa/')) {
+    if (isSecondaryTaqeemAppReady(url)) {
         return;
     }
     if (!lower.includes('sso.taqeem.gov.sa') && !lower.includes('openid-connect')) {
@@ -778,9 +627,81 @@ const authHandlers = {
         const loginTimeoutMs = Number(opts.loginTimeoutMs) || 180000;
         const skipBatchLookup = opts.skipBatchLookup === true;
         const closeAfterAction = opts.closeAfterAction === true;
+        const forceElectronSecondary = opts.useElectronSecondaryApproval === true;
         let reportIds = normalizeReportIds(opts.reportIds || opts.reports || []);
 
         try {
+            if (!reportIds.length && batchId && skipBatchLookup) {
+                return {
+                    status: 'ERROR',
+                    error: `No submitted report IDs were provided for batch ${batchId}`
+                };
+            }
+
+            if (!reportIds.length && batchId) {
+                try {
+                    const batchResult = await withTimeout(
+                        pythonAPI.auth.getReportsByBatch(batchId),
+                        20000,
+                        `Loading submitted reports for batch ${batchId}`
+                    );
+                    if (batchResult?.status === 'SUCCESS' && Array.isArray(batchResult.reports)) {
+                        reportIds = normalizeReportIds(batchResult.reports);
+                    } else {
+                        return { status: 'ERROR', error: batchResult?.error || `No reports found for batch ${batchId}` };
+                    }
+                } catch (err) {
+                    return { status: 'ERROR', error: err.message || String(err) };
+                }
+            }
+
+            // Dedicated Chrome (isolated profile) for secondary approvals — default; avoids Electron + primary conflicts.
+            if (!forceElectronSecondary && reportIds.length > 0) {
+                const tabsNum = Math.max(
+                    1,
+                    Math.min(
+                        32,
+                        Number(opts.tabsNum) > 0 ? Math.floor(Number(opts.tabsNum)) : 4,
+                    ),
+                );
+                const wallSlots = Math.max(
+                    1,
+                    Math.ceil(reportIds.length / tabsNum),
+                );
+                const approvalBudgetMs = Math.min(
+                    55 * 60 * 1000,
+                    wallSlots * 95000 + loginTimeoutMs + 240000,
+                );
+                const pyResult = await withTimeout(
+                    pythonAPI.auth.taqeemSecondaryApproveReports({
+                        reportIds,
+                        loginUrl,
+                        waitForLogin,
+                        loginTimeoutMs,
+                        tabsNum,
+                        approvalLoadTimeoutMs: opts.approvalLoadTimeoutMs,
+                        approvalUiDeadlineMs: opts.approvalUiDeadlineMs,
+                        approvalPollMs: opts.approvalPollMs
+                    }),
+                    approvalBudgetMs,
+                    'Taqeem secondary Chrome approval'
+                );
+
+                if (pyResult?.status !== 'SUCCESS') {
+                    return {
+                        status: 'ERROR',
+                        error: pyResult?.error || 'Secondary Chrome approval failed'
+                    };
+                }
+
+                return {
+                    status: 'SUCCESS',
+                    message: pyResult.message
+                        || 'Completed Taqeem report approvals in dedicated Chrome (secondary profile).',
+                    batch: pyResult.batch || null
+                };
+            }
+
             if (automationOnly) {
                 const automationResult = await pythonAPI.auth.openLoginPage(loginUrl, {
                     onlyIfClosed: openIfClosed,
@@ -870,44 +791,23 @@ const authHandlers = {
                 await loadSecondaryTaqeemSessionStart(secondaryLoginWindow, loginUrl);
             }
 
-            if (!reportIds.length && batchId && skipBatchLookup) {
-                return {
-                    status: 'ERROR',
-                    error: `No submitted report IDs were provided for batch ${batchId}`
-                };
-            }
-
-            if (!reportIds.length && batchId) {
-                try {
-                    const batchResult = await withTimeout(
-                        pythonAPI.auth.getReportsByBatch(batchId),
-                        20000,
-                        `Loading submitted reports for batch ${batchId}`
-                    );
-                    if (batchResult?.status === 'SUCCESS' && Array.isArray(batchResult.reports)) {
-                        reportIds = normalizeReportIds(batchResult.reports);
-                    } else {
-                        return { status: 'ERROR', error: batchResult?.error || `No reports found for batch ${batchId}` };
-                    }
-                } catch (err) {
-                    return { status: 'ERROR', error: err.message || String(err) };
-                }
-            }
-
             let batchSummary = null;
             if (reportIds.length > 0) {
                 if (waitForLogin) {
                     await waitForSecondaryLogin(secondaryLoginWindow, loginTimeoutMs);
                 }
-                batchSummary = await confirmReportsParallelPool(secondaryLoginWindow, reportIds, {
-                    concurrency: Number(opts.approvalConcurrency) || undefined,
-                    showWorkerWindows: opts.approvalShowWorkerWindows === true,
+                const approvalFlowOpts = resolveApprovalFlowOpts({
                     loadTimeoutMs: opts.approvalLoadTimeoutMs,
                     uiDeadlineMs: opts.approvalUiDeadlineMs,
                     postClickDelayMs: opts.approvalPostClickDelayMs,
                     retries: opts.approvalRetries,
                     pollMs: opts.approvalPollMs
                 });
+                batchSummary = await confirmReportsBatch(
+                    secondaryLoginWindow,
+                    reportIds,
+                    approvalFlowOpts
+                );
             }
 
             if (closeAfterAction && secondaryLoginWindow && !secondaryLoginWindow.isDestroyed()) {

@@ -638,7 +638,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     };
   }, [selectedCompany]);
 
-  const ensureElrajhiActionReady = async () => {
+  const ensureElrajhiActionReady = async (options = {}) => {
+    const { skipPrimaryAutomationBrowserCheck = false } = options;
+
     if (!elrajhiCompanyContext) {
       throw new Error(
         "Select a company (office) before running ElRajhi actions.",
@@ -687,6 +689,10 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           authStatus?.error ||
           "Taqeem authorization failed. Complete Taqeem login first.",
       );
+    }
+
+    if (skipPrimaryAutomationBrowserCheck) {
+      return true;
     }
 
     if (!window?.electronAPI?.checkStatus) {
@@ -1126,7 +1132,21 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     setBatchActionLoading((prev) => ({ ...prev, [batchId]: true }));
 
     try {
-      await ensureElrajhiActionReady();
+      if (action === "approve-reports") {
+        if (!window?.electronAPI?.openTaqeemLogin) {
+          throw new Error(
+            "Desktop integration unavailable. Restart the app.",
+          );
+        }
+        setBatchMessage({
+          type: "info",
+          text: t("elRajhiUpload.msgTaqeemOpeningBatch", { batchId }),
+        });
+      }
+
+      await ensureElrajhiActionReady({
+        skipPrimaryAutomationBrowserCheck: action === "approve-reports",
+      });
 
       switch (action) {
         case "check-status":
@@ -1216,17 +1236,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
         }
 
         case "approve-reports":
-          if (!window?.electronAPI?.openTaqeemLogin) {
-            throw new Error(
-              "Desktop integration unavailable. Restart the app.",
-            );
-          }
-
-          setBatchMessage({
-            type: "info",
-            text: t("elRajhiUpload.msgTaqeemOpeningBatch", { batchId }),
-          });
-
           {
             const reports = await ensureBatchReportsLoaded(batchId);
             const reportIds = buildTaqeemReportIds(reports);
@@ -1242,12 +1251,9 @@ const UploadReportElrajhi = ({ onViewChange }) => {
               skipBatchLookup: true,
               preferChrome: false,
               waitForLogin: true,
+              tabsNum: Math.max(Number(recommendedTabs) || 1, 1),
               // Keep secondary Taqeem window open so persist:taqeem-secondary stays warm; cookies remain on disk regardless.
               closeAfterAction: false,
-              // Parallel BrowserWindows (shared session). Override with env TAQEEM_APPROVAL_CONCURRENCY.
-              approvalConcurrency: 10,
-              // Show extra cascaded windows when batch is large (same persisted session as the main secondary window).
-              approvalShowWorkerWindows: reportIds.length >= 5,
             });
 
             if (result?.status !== "SUCCESS") {
@@ -3225,6 +3231,14 @@ const UploadReportElrajhi = ({ onViewChange }) => {
                   ? t("elRajhiUpload.actionDownloadCertificates")
                   : t("elRajhiUpload.bulkDownloadCert");
 
+    if (action === "approve-reports" && !window?.electronAPI?.openTaqeemLogin) {
+      setBatchMessage({
+        type: "error",
+        text: t("elRajhiUpload.desktopIntegrationUnavailable"),
+      });
+      return;
+    }
+
     // Common function for actions that require authentication
     const executeAuthenticatedAction = async (
       actionFunc,
@@ -3239,14 +3253,19 @@ const UploadReportElrajhi = ({ onViewChange }) => {
     setBatchPaused((prev) => ({ ...prev, [batchId]: false }));
     setBatchMessage({
       type: "info",
-      text: t("elRajhiUpload.actionInProgress", {
-        action: readableAction,
-        count: selected.length,
-      }),
+      text:
+        action === "approve-reports"
+          ? t("elRajhiUpload.msgTaqeemOpeningBatch", { batchId })
+          : t("elRajhiUpload.actionInProgress", {
+              action: readableAction,
+              count: selected.length,
+            }),
     });
 
     try {
-      await ensureElrajhiActionReady();
+      await ensureElrajhiActionReady({
+        skipPrimaryAutomationBrowserCheck: action === "approve-reports",
+      });
 
       if (action === "retry-submit") {
         await executeAuthenticatedAction(
@@ -3449,17 +3468,6 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           },
         );
       } else if (action === "approve-reports") {
-        if (!window?.electronAPI?.openTaqeemLogin) {
-          throw new Error(
-            t("elRajhiUpload.desktopIntegrationUnavailable"),
-          );
-        }
-
-        setBatchMessage({
-          type: "info",
-          text: t("elRajhiUpload.msgTaqeemOpeningBatch", { batchId }),
-        });
-
         const reportIds = buildTaqeemReportIds(selected);
         if (!reportIds.length) {
           throw new Error(t("elRajhiUpload.msgNoTaqeemIdsBatch", { batchId }));
@@ -3471,9 +3479,8 @@ const UploadReportElrajhi = ({ onViewChange }) => {
           skipBatchLookup: true,
           preferChrome: false,
           waitForLogin: true,
+          tabsNum: Math.max(Number(recommendedTabs) || 1, 1),
           closeAfterAction: false,
-          approvalConcurrency: 10,
-          approvalShowWorkerWindows: reportIds.length >= 5,
         });
 
         if (result?.status !== "SUCCESS") {

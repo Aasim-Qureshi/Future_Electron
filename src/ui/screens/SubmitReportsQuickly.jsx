@@ -41,6 +41,7 @@ import {
 import {
   ensureTaqeemAuthorized,
   extractTaqeemUsernameFromUser,
+  isTaqeemAuthSuccess,
 } from "../../shared/helper/taqeemAuthWrap";
 import { deductPoints } from "../utils/points";
 import { downloadTemplateFile } from "../utils/templateDownload";
@@ -149,21 +150,6 @@ const DEFAULT_REPORT_INFO_FORM = {
   report_type: "تقرير مفصل",
   telephone: "999999999",
   email: "a@a.com",
-};
-
-const isTaqeemAuthSuccess = (authStatus) => {
-  if (authStatus === true) return true;
-  if (authStatus?.success === true) return true;
-  const status = String(authStatus?.status || "").toUpperCase();
-  return (
-    status === "SUCCESS" ||
-    status === "CHECK" ||
-    status === "AUTHORIZED" ||
-    status === "SYNCED" ||
-    status === "LOGIN_SUCCESS" ||
-    status === "NORMAL_ACCOUNT" ||
-    status === "BOOTSTRAP_GRANTED"
-  );
 };
 
 const getTaqeemAuthErrorMessage = (authStatus, fallback) =>
@@ -878,6 +864,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       guestAccessEnabled,
       cachedUser: user || null,
       selectedCompanyOfficeId: selectedCompanyOfficeId || null,
+      disableAppAuthRedirects: true,
     }),
     [guestSession, guestAccessEnabled, selectedCompanyOfficeId, user],
   );
@@ -948,6 +935,110 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
   const reportCreatedCacheRef = useRef(new Map());
   const pendingCompanySelectionRef = useRef(null);
   const isTaqeemLoggedIn = taqeemStatus?.state === "success";
+
+  /** Same Taqeem/session/electron gate as ElRajhi before uploads and desktop actions. */
+  const ensureQuickUploadActionReady = useCallback(
+    async (authTokenOverride = null) => {
+      if (!selectedCompanyOfficeId) {
+        throw new Error(
+          translate(
+            "messages.error.companyRequiredForUpload",
+            "Select a company before uploading reports.",
+          ),
+        );
+      }
+
+      const tokenForAuth = authTokenOverride ?? token;
+      const guestForAuth = isGuest || !tokenForAuth;
+      const officeIdForAuth =
+        selectedCompany?.officeId || selectedCompany?.office_id || null;
+
+      const authStatus = await ensureTaqeemAuthorized(
+        tokenForAuth,
+        onViewChange,
+        taqeemStatus?.state === "success",
+        0,
+        login,
+        setTaqeemStatus,
+        {
+          isGuest: guestForAuth,
+          guestAccessEnabled: systemState?.guestAccessEnabled ?? true,
+          cachedUser: user || null,
+          selectedCompanyOfficeId: officeIdForAuth,
+          disableAppAuthRedirects: true,
+        },
+      );
+
+      if (authStatus?.status === "INSUFFICIENT_POINTS") {
+        setShowInsufficientPointsModal(true);
+        throw new Error(
+          authStatus?.message ||
+            authStatus?.reason ||
+            translate(
+              "messages.error.insufficientPoints",
+              "You don't have enough points for this action.",
+            ),
+        );
+      }
+
+      if (authStatus?.status === "LOGIN_REQUIRED") {
+        throw new Error(
+          translate(
+            "messages.error.taqeemLoginRequired",
+            "Taqeem login required. Finish login and choose a company to continue.",
+          ),
+        );
+      }
+
+      if (!isTaqeemAuthSuccess(authStatus)) {
+        throw new Error(
+          getTaqeemAuthErrorMessage(
+            authStatus,
+            translate(
+              "messages.error.taqeemLoginRequired",
+              "Taqeem login required. Finish login and choose a company to continue.",
+            ),
+          ),
+        );
+      }
+
+      if (!window?.electronAPI?.checkStatus) {
+        return authStatus;
+      }
+
+      const status = await window.electronAPI.checkStatus();
+      const statusCode = String(status?.status || "").toUpperCase();
+      const isReady = Boolean(
+        status?.browserOpen && statusCode.includes("SUCCESS"),
+      );
+
+      if (!isReady) {
+        throw new Error(
+          status?.error ||
+            translate(
+              "messages.error.taqeemBrowserOff",
+              "Taqeem connection is off. Turn Taqeem connection on, then retry.",
+            ),
+        );
+      }
+
+      return authStatus;
+    },
+    [
+      isGuest,
+      login,
+      onViewChange,
+      selectedCompany,
+      selectedCompanyOfficeId,
+      setShowInsufficientPointsModal,
+      setTaqeemStatus,
+      systemState?.guestAccessEnabled,
+      taqeemStatus?.state,
+      token,
+      translate,
+      user,
+    ],
+  );
 
   useEffect(() => {
     if (ALLOWED_REPORT_FILTERS.has(reportSelectFilter)) return;
@@ -1136,199 +1227,234 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
   );
 
   const handleStoreAndSubmit = async () => {
+    resetMessages();
+    resetPendingSubmit();
+    resetReturnView();
+
+    if (excelFiles.length === 0) {
+      setError(
+        translate(
+          "messages.error.selectExcelFile",
+          "Please select at least one Excel file",
+        ),
+      );
+      return;
+    }
+    if (wantsPdfUpload && pdfFiles.length === 0) {
+      setError(
+        translate(
+          "messages.error.selectPdfFile",
+          "Please select at least one PDF file or disable PDF upload.",
+        ),
+      );
+      return;
+    }
+    if (
+      wantsPdfUpload &&
+      (pdfMatchInfo.excelsMissingPdf.length ||
+        pdfMatchInfo.unmatchedPdfs.length)
+    ) {
+      setError(
+        translate(
+          "messages.error.pdfNamesMismatch",
+          "PDF filenames must match the Excel filenames.",
+        ),
+      );
+      return;
+    }
+    if (!isReadyToUpload) {
+      setError(
+        translate(
+          "messages.error.validationIssues",
+          "Please fix validation issues before uploading.",
+        ),
+      );
+      return;
+    }
+
+    setStoreAndSubmitLoading(true);
     try {
-      setStoreAndSubmitLoading(true);
-      resetMessages();
-      resetPendingSubmit();
-      resetReturnView();
+      const outcome = await executeWithAuth(
+        async (params) => {
+          const { token: authToken } = params;
 
-      if (excelFiles.length === 0) {
-        throw new Error(
-          translate(
-            "messages.error.selectExcelFile",
-            "Please select at least one Excel file",
-          ),
-        );
-      }
-      if (wantsPdfUpload && pdfFiles.length === 0) {
-        throw new Error(
-          translate(
-            "messages.error.selectPdfFile",
-            "Please select at least one PDF file or disable PDF upload.",
-          ),
-        );
-      }
-      if (
-        wantsPdfUpload &&
-        (pdfMatchInfo.excelsMissingPdf.length ||
-          pdfMatchInfo.unmatchedPdfs.length)
-      ) {
-        throw new Error(
-          translate(
-            "messages.error.pdfNamesMismatch",
-            "PDF filenames must match the Excel filenames.",
-          ),
-        );
-      }
-      if (!isReadyToUpload) {
-        throw new Error(
-          translate(
-            "messages.error.validationIssues",
-            "Please fix validation issues before uploading.",
-          ),
-        );
-      }
+          await ensureQuickUploadActionReady(authToken);
 
-      if (!extractTaqeemUsernameFromUser(user || {})) {
-        throw new Error(
-          translate(
-            "messages.error.taqeemRequiredForUpload",
-            "Log in to Taqeem and link your account before uploading reports.",
-          ),
-        );
-      }
-      if (!selectedCompanyOfficeId) {
-        throw new Error(
-          translate(
-            "messages.error.companyRequiredForUpload",
-            "Select a company before uploading reports.",
-          ),
-        );
-      }
+          if (!extractTaqeemUsernameFromUser(user || {})) {
+            throw new Error(
+              translate(
+                "messages.error.taqeemRequiredForUpload",
+                "Log in to Taqeem and link your account before uploading reports.",
+              ),
+            );
+          }
 
-      const activeToken = await resolveActiveApiToken();
+          if (!authToken) {
+            throw new Error(
+              translate(
+                "messages.error.noApiToken",
+                "No login session. Restart the app or wait for connection.",
+              ),
+            );
+          }
+          const activeToken = authToken;
 
-      setSuccess(
-        translate(
-          "messages.success.uploadingFiles",
-          "Uploading files to server...",
-        ),
+          setSuccess(
+            translate(
+              "messages.success.uploadingFiles",
+              "Uploading files to server...",
+            ),
+          );
+
+          let pdfPaths = {};
+          if (wantsPdfUpload && pdfFiles.length > 0) {
+            pdfPaths = await getAbsolutePaths(pdfFiles, false);
+          } else {
+            pdfPaths = await getAbsolutePaths([], true, excelFiles);
+          }
+
+          const data = await submitReportsQuicklyUpload(
+            excelFiles,
+            wantsPdfUpload ? pdfFiles : [],
+            !wantsPdfUpload,
+            selectedCompanyOfficeId || null,
+            pdfPaths,
+          );
+
+          if (data.status !== "success") {
+            throw new Error(
+              data.error ||
+                translate("messages.error.uploadFailed", "Upload failed"),
+            );
+          }
+
+          const createdReports = Array.isArray(data.reports) ? data.reports : [];
+          if (createdReports.length) {
+            setReports((prev) => mergeReports(prev, createdReports));
+            await applyUploadFormToCreatedReports(createdReports);
+          }
+
+          const insertedCount = data.created || 0;
+          if (insertedCount > 0) {
+            recordUploadBatch(selectedCompanyOfficeId, "quick", {
+              inserted: insertedCount,
+              nameHint: selectedCompany?.name,
+            });
+          }
+          setSuccess(
+            translate(
+              "messages.success.filesUploadedSubmitting",
+              "Files uploaded successfully. Inserted {{count}} report(s). Now submitting to Taqeem...",
+              { count: insertedCount },
+            ),
+          );
+          setExcelFiles([]);
+          setPdfFiles([]);
+          setWantsPdfUpload(false);
+
+          const refreshedReports = await loadReports(activeToken);
+          const uploadedReports = Array.isArray(data.reports) ? data.reports : [];
+          const candidateReports = uploadedReports.length
+            ? uploadedReports
+            : refreshedReports;
+
+          const recentReports = [...candidateReports]
+            .sort(
+              (a, b) =>
+                new Date(b.createdAt || b.submitted_at || 0) -
+                new Date(a.createdAt || a.submitted_at || 0),
+            )
+            .slice(0, insertedCount);
+
+          if (insertedCount > 0 && recentReports.length === 0) {
+            throw new Error("Could not find the newly uploaded reports.");
+          }
+
+          const reportIds = recentReports
+            .map((report) => getReportRecordId(report))
+            .filter(Boolean);
+          if (!reportIds.length) {
+            throw new Error(
+              "Could not resolve uploaded report IDs for submission.",
+            );
+          }
+
+          const reportMetaById = recentReports.reduce((acc, report) => {
+            const id = getReportRecordId(report);
+            if (!id) return acc;
+            acc[id] = {
+              assetCount: resolveReportAssetCount(report),
+              batchId: report?.batch_id || report?.batchId || null,
+            };
+            return acc;
+          }, {});
+
+          const tabsNum = Math.max(1, Number(recommendedTabs) || 3);
+          const queuePayload = {
+            source: QUICK_PAGE_SOURCE,
+            reportIds,
+            reportMetaById,
+            tabsNum,
+            currentIndex: 0,
+            resumeOnLoad: false,
+            updatedAt: Date.now(),
+          };
+          setPendingSubmit(queuePayload);
+
+          const queueResult = await runPendingSubmitQueue(queuePayload);
+          if (queueResult?.paused) {
+            setSuccess(
+              translate(
+                "messages.success.reportsStoredResumeAfterLogin",
+                "Reports were stored successfully. Login to Value Tech with your phone and submission will continue automatically.",
+              ),
+            );
+            return true;
+          }
+
+          const successCount = Number(queueResult?.completedCount) || 0;
+          if (successCount <= 0) {
+            throw new Error("All report submissions failed. Please try again.");
+          }
+
+          setSuccess(
+            translate(
+              "messages.success.successfulUploads",
+              "{{count}} report(s) uploaded and submitted to Taqeem successfully.",
+              { count: successCount },
+            ),
+          );
+          return true;
+        },
+        { token },
+        {
+          requiredPoints: 0,
+          skipNavigateToCompany: true,
+          showInsufficientPointsModal: () => setShowInsufficientPointsModal(true),
+          onViewChange,
+          onAuthFailure: (reason) => {
+            if (reason === "INSUFFICIENT_POINTS") return;
+            if (reason === "LOGIN_REQUIRED") {
+              setError(
+                translate(
+                  "messages.error.taqeemLoginRequired",
+                  "Taqeem login required. Finish login and choose a company to continue.",
+                ),
+              );
+              return;
+            }
+            const msg =
+              (typeof reason === "object" && reason?.message) ||
+              (typeof reason === "string" ? reason : "") ||
+              "";
+            if (msg) setError(msg);
+          },
+        },
       );
 
-      // Inside handleStoreAndSubmit, replace the PDF path handling section:
-
-      let pdfPaths = {};
-      if (wantsPdfUpload && pdfFiles.length > 0) {
-        pdfPaths = await getAbsolutePaths(pdfFiles, false);
-      } else {
-        // No PDF upload - use dummy PDFs for all Excel files
-        pdfPaths = await getAbsolutePaths([], true, excelFiles);
-      }
-
-      // Pass pdfPathMap to the API function
-      const data = await submitReportsQuicklyUpload(
-        excelFiles,
-        wantsPdfUpload ? pdfFiles : [],
-        !wantsPdfUpload, // skipPdfUpload flag
-        selectedCompanyOfficeId || null,
-        pdfPaths, // Pass the pdfPaths object
-      );
-
-      if (data.status !== "success") {
-        throw new Error(
-          data.error ||
-            translate("messages.error.uploadFailed", "Upload failed"),
-        );
-      }
-
-      const createdReports = Array.isArray(data.reports) ? data.reports : [];
-      if (createdReports.length) {
-        setReports((prev) => mergeReports(prev, createdReports));
-        await applyUploadFormToCreatedReports(createdReports);
-      }
-
-      const insertedCount = data.created || 0;
-      if (insertedCount > 0) {
-        recordUploadBatch(selectedCompanyOfficeId, "quick", {
-          inserted: insertedCount,
-          nameHint: selectedCompany?.name,
-        });
-      }
-      setSuccess(
-        translate(
-          "messages.success.filesUploadedSubmitting",
-          "Files uploaded successfully. Inserted {{count}} report(s). Now submitting to Taqeem...",
-          { count: insertedCount },
-        ),
-      );
-      setExcelFiles([]);
-      setPdfFiles([]);
-      setWantsPdfUpload(false);
-
-      // Refresh reports to get the newly uploaded ones
-      const refreshedReports = await loadReports(activeToken);
-      const uploadedReports = Array.isArray(data.reports) ? data.reports : [];
-      const candidateReports = uploadedReports.length
-        ? uploadedReports
-        : refreshedReports;
-
-      // Get the newly uploaded reports (assuming they're the most recent)
-      const recentReports = [...candidateReports]
-        .sort(
-          (a, b) =>
-            new Date(b.createdAt || b.submitted_at || 0) -
-            new Date(a.createdAt || a.submitted_at || 0),
-        )
-        .slice(0, insertedCount);
-
-      if (insertedCount > 0 && recentReports.length === 0) {
-        throw new Error("Could not find the newly uploaded reports.");
-      }
-
-      const reportIds = recentReports
-        .map((report) => getReportRecordId(report))
-        .filter(Boolean);
-      if (!reportIds.length) {
-        throw new Error(
-          "Could not resolve uploaded report IDs for submission.",
-        );
-      }
-
-      const reportMetaById = recentReports.reduce((acc, report) => {
-        const id = getReportRecordId(report);
-        if (!id) return acc;
-        acc[id] = {
-          assetCount: resolveReportAssetCount(report),
-          batchId: report?.batch_id || report?.batchId || null,
-        };
-        return acc;
-      }, {});
-
-      const tabsNum = Math.max(1, Number(recommendedTabs) || 3);
-      const queuePayload = {
-        source: QUICK_PAGE_SOURCE,
-        reportIds,
-        reportMetaById,
-        tabsNum,
-        currentIndex: 0,
-        resumeOnLoad: false,
-        updatedAt: Date.now(),
-      };
-      setPendingSubmit(queuePayload);
-
-      const queueResult = await runPendingSubmitQueue(queuePayload);
-      if (queueResult?.paused) {
-        setSuccess(
-          translate(
-            "messages.success.reportsStoredResumeAfterLogin",
-            "Reports were stored successfully. Login to Value Tech with your phone and submission will continue automatically.",
-          ),
-        );
+      if (outcome === null) {
         return;
       }
-
-      const successCount = Number(queueResult?.completedCount) || 0;
-      if (successCount <= 0) {
-        throw new Error("All report submissions failed. Please try again.");
-      }
-
-      setSuccess(
-        translate(
-          "messages.success.successfulUploads",
-          "{{count}} report(s) uploaded and submitted to Taqeem successfully.",
-          { count: successCount },
-        ),
-      );
     } catch (err) {
       console.error("Store and Submit failed", err);
       const status = err?.response?.status;
@@ -2262,124 +2388,161 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
   ]);
 
   const handleUpload = async () => {
+    resetMessages();
+
+    if (excelFiles.length === 0) {
+      setError(
+        translate(
+          "messages.error.selectExcelFile",
+          "Please select at least one Excel file",
+        ),
+      );
+      return;
+    }
+    if (wantsPdfUpload && pdfFiles.length === 0) {
+      setError(
+        translate(
+          "messages.error.selectPdfFile",
+          "Please select at least one PDF file or disable PDF upload.",
+        ),
+      );
+      return;
+    }
+    if (
+      wantsPdfUpload &&
+      (pdfMatchInfo.excelsMissingPdf.length ||
+        pdfMatchInfo.unmatchedPdfs.length)
+    ) {
+      setError(
+        translate(
+          "messages.error.pdfNamesMismatch",
+          "PDF filenames must match the Excel filenames.",
+        ),
+      );
+      return;
+    }
+    if (!isReadyToUpload) {
+      setError(
+        translate(
+          "messages.error.validationIssues",
+          "Please fix validation issues before uploading.",
+        ),
+      );
+      return;
+    }
+
+    setStoreOnlyLoading(true);
     try {
-      setStoreOnlyLoading(true);
-      resetMessages();
+      const outcome = await executeWithAuth(
+        async (params) => {
+          const { token: authToken } = params;
 
-      if (excelFiles.length === 0) {
-        throw new Error(
-          translate(
-            "messages.error.selectExcelFile",
-            "Please select at least one Excel file",
-          ),
-        );
-      }
-      if (wantsPdfUpload && pdfFiles.length === 0) {
-        throw new Error(
-          translate(
-            "messages.error.selectPdfFile",
-            "Please select at least one PDF file or disable PDF upload.",
-          ),
-        );
-      }
-      if (
-        wantsPdfUpload &&
-        (pdfMatchInfo.excelsMissingPdf.length ||
-          pdfMatchInfo.unmatchedPdfs.length)
-      ) {
-        throw new Error(
-          translate(
-            "messages.error.pdfNamesMismatch",
-            "PDF filenames must match the Excel filenames.",
-          ),
-        );
-      }
-      if (!isReadyToUpload) {
-        throw new Error(
-          translate(
-            "messages.error.validationIssues",
-            "Please fix validation issues before uploading.",
-          ),
-        );
-      }
+          await ensureQuickUploadActionReady(authToken);
 
-      if (!extractTaqeemUsernameFromUser(user || {})) {
-        throw new Error(
-          translate(
-            "messages.error.taqeemRequiredForUpload",
-            "Log in to Taqeem and link your account before uploading reports.",
-          ),
-        );
-      }
-      if (!selectedCompanyOfficeId) {
-        throw new Error(
-          translate(
-            "messages.error.companyRequiredForUpload",
-            "Select a company before uploading reports.",
-          ),
-        );
-      }
+          if (!extractTaqeemUsernameFromUser(user || {})) {
+            throw new Error(
+              translate(
+                "messages.error.taqeemRequiredForUpload",
+                "Log in to Taqeem and link your account before uploading reports.",
+              ),
+            );
+          }
 
-      const activeToken = await resolveActiveApiToken();
+          if (!authToken) {
+            throw new Error(
+              translate(
+                "messages.error.noApiToken",
+                "No login session. Restart the app or wait for connection.",
+              ),
+            );
+          }
+          const activeToken = authToken;
 
-      setSuccess(
-        translate(
-          "messages.success.uploadingFiles",
-          "Uploading files to server...",
-        ),
+          setSuccess(
+            translate(
+              "messages.success.uploadingFiles",
+              "Uploading files to server...",
+            ),
+          );
+
+          let pdfPaths = {};
+          if (wantsPdfUpload && pdfFiles.length > 0) {
+            pdfPaths = await getAbsolutePaths(pdfFiles, false);
+          } else {
+            pdfPaths = await getAbsolutePaths([], true, excelFiles);
+          }
+
+          const data = await submitReportsQuicklyUpload(
+            excelFiles,
+            wantsPdfUpload ? pdfFiles : [],
+            !wantsPdfUpload,
+            selectedCompanyOfficeId || null,
+            pdfPaths,
+          );
+
+          if (data.status !== "success") {
+            throw new Error(
+              data.error ||
+                translate("messages.error.uploadFailed", "Upload failed"),
+            );
+          }
+
+          const createdReports = Array.isArray(data.reports) ? data.reports : [];
+          if (createdReports.length) {
+            setReports((prev) => mergeReports(prev, createdReports));
+            await applyUploadFormToCreatedReports(createdReports);
+          }
+
+          const insertedCount = data.created || 0;
+          if (insertedCount > 0) {
+            recordUploadBatch(selectedCompanyOfficeId, "quick", {
+              inserted: insertedCount,
+              nameHint: selectedCompany?.name,
+            });
+          }
+          setSuccess(
+            translate(
+              "messages.success.filesUploaded",
+              "Files uploaded successfully. Inserted {{count}} report(s).",
+              { count: insertedCount },
+            ),
+          );
+          await loadReports(activeToken);
+          setExcelFiles([]);
+          setPdfFiles([]);
+          setPdfPathMap({});
+          setWantsPdfUpload(false);
+          return true;
+        },
+        { token },
+        {
+          requiredPoints: 0,
+          skipNavigateToCompany: true,
+          showInsufficientPointsModal: () => setShowInsufficientPointsModal(true),
+          onViewChange,
+          onAuthFailure: (reason) => {
+            if (reason === "INSUFFICIENT_POINTS") return;
+            if (reason === "LOGIN_REQUIRED") {
+              setError(
+                translate(
+                  "messages.error.taqeemLoginRequired",
+                  "Taqeem login required. Finish login and choose a company to continue.",
+                ),
+              );
+              return;
+            }
+            const msg =
+              (typeof reason === "object" && reason?.message) ||
+              (typeof reason === "string" ? reason : "") ||
+              "";
+            if (msg) setError(msg);
+          },
+        },
       );
 
-      // Inside handleUpload, replace the PDF path handling section:
-
-      let pdfPaths = {};
-      if (wantsPdfUpload && pdfFiles.length > 0) {
-        pdfPaths = await getAbsolutePaths(pdfFiles, false);
-      } else {
-        // No PDF upload - use dummy PDFs for all Excel files
-        pdfPaths = await getAbsolutePaths([], true, excelFiles);
+      if (outcome === null) {
+        return;
       }
-
-      // Pass pdfPathMap to the API function
-      const data = await submitReportsQuicklyUpload(
-        excelFiles,
-        wantsPdfUpload ? pdfFiles : [],
-        !wantsPdfUpload, // skipPdfUpload flag
-        selectedCompanyOfficeId || null,
-        pdfPaths, // Pass the pdfPaths object
-      );
-
-      if (data.status !== "success") {
-        throw new Error(
-          data.error ||
-            translate("messages.error.uploadFailed", "Upload failed"),
-        );
-      }
-
-      const createdReports = Array.isArray(data.reports) ? data.reports : [];
-      if (createdReports.length) {
-        setReports((prev) => mergeReports(prev, createdReports));
-        await applyUploadFormToCreatedReports(createdReports);
-      }
-
-      const insertedCount = data.created || 0;
-      if (insertedCount > 0) {
-        recordUploadBatch(selectedCompanyOfficeId, "quick", {
-          inserted: insertedCount,
-          nameHint: selectedCompany?.name,
-        });
-      }
-      setSuccess(
-        translate(
-          "messages.success.filesUploaded",
-          "Files uploaded successfully. Inserted {{count}} report(s).",
-          { count: insertedCount },
-        ),
-      );
-      await loadReports(activeToken);
-      setExcelFiles([]);
-      setPdfFiles([]);
-      setPdfPathMap({}); // Reset path map
-      setWantsPdfUpload(false);
     } catch (err) {
       console.error("Upload failed", err);
       const status = err?.response?.status;
@@ -2892,16 +3055,29 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       setReportActionBusy((prev) => ({ ...prev, [recordId]: true }));
 
       try {
+        let sessionToken = token;
+        if (!sessionToken && window?.electronAPI?.getToken) {
+          try {
+            const tokenObj = await window.electronAPI.getToken();
+            sessionToken = tokenObj?.refreshToken || tokenObj?.token || null;
+          } catch {
+            sessionToken = null;
+          }
+        }
+
         let authStatus = true;
         if (!skipAuth) {
           authStatus = await ensureTaqeemAuthorized(
-            token,
+            sessionToken,
             onViewChange,
             isTaqeemLoggedIn,
             assetCount,
             login,
             setTaqeemStatus,
-            authOptions,
+            {
+              ...authOptions,
+              isGuest: isGuest || !sessionToken,
+            },
           );
         }
         if (authStatus?.status === "INSUFFICIENT_POINTS") {
@@ -3015,7 +3191,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
               "Report submitted to Taqeem successfully.",
             ),
           );
-          const activeToken = authStatus?.token || token;
+          const activeToken = authStatus?.token || sessionToken;
           const createdReportId =
             result?.reportId ||
             result?.report_id ||
@@ -3114,6 +3290,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     [
       authOptions,
       ensureCompanySelected,
+      isGuest,
       isTaqeemLoggedIn,
       login,
       loadReports,
@@ -3240,13 +3417,32 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
   useEffect(() => {
     if (storeAndSubmitLoading || submitting) return;
     if (!pendingSubmit?.resumeOnLoad) return;
-    if (!token) return;
     if (taqeemStatus?.state !== "success") return;
 
-    setPendingSubmit((prev) =>
-      prev ? { ...prev, resumeOnLoad: false, updatedAt: Date.now() } : prev,
-    );
-    runPendingSubmitQueue(pendingSubmit, { resume: true });
+    let cancelled = false;
+
+    const tryResume = async () => {
+      let activeToken = token;
+      if (!activeToken && window?.electronAPI?.getToken) {
+        try {
+          const tokenObj = await window.electronAPI.getToken();
+          activeToken = tokenObj?.refreshToken || tokenObj?.token || null;
+        } catch {
+          activeToken = null;
+        }
+      }
+      if (!activeToken || cancelled) return;
+
+      setPendingSubmit((prev) =>
+        prev ? { ...prev, resumeOnLoad: false, updatedAt: Date.now() } : prev,
+      );
+      await runPendingSubmitQueue(pendingSubmit, { resume: true });
+    };
+
+    void tryResume();
+    return () => {
+      cancelled = true;
+    };
   }, [
     pendingSubmit,
     runPendingSubmitQueue,
@@ -3494,14 +3690,26 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       }
 
       // Ensure login and company selection before any submission/retry
+      let bulkSessionToken = token;
+      if (!bulkSessionToken && window?.electronAPI?.getToken) {
+        try {
+          const tokenObj = await window.electronAPI.getToken();
+          bulkSessionToken = tokenObj?.refreshToken || tokenObj?.token || null;
+        } catch {
+          bulkSessionToken = null;
+        }
+      }
       const authStatus = await ensureTaqeemAuthorized(
-        token,
+        bulkSessionToken,
         onViewChange,
         taqeemStatus?.state === "success",
         0,
         login,
         setTaqeemStatus,
-        authOptions,
+        {
+          ...authOptions,
+          isGuest: isGuest || !bulkSessionToken,
+        },
       );
       if (authStatus?.status === "INSUFFICIENT_POINTS") {
         setError(
@@ -3789,14 +3997,27 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       const tabsNum = resolveTabsForAssets(assetCount);
       setReportActionBusy((prev) => ({ ...prev, [recordId]: true }));
       try {
+        let retrySessionToken = token;
+        if (!retrySessionToken && window?.electronAPI?.getToken) {
+          try {
+            const tokenObj = await window.electronAPI.getToken();
+            retrySessionToken =
+              tokenObj?.refreshToken || tokenObj?.token || null;
+          } catch {
+            retrySessionToken = null;
+          }
+        }
         const authStatus = await ensureTaqeemAuthorized(
-          token,
+          retrySessionToken,
           onViewChange,
           taqeemStatus?.state === "success",
           0,
           login,
           setTaqeemStatus,
-          authOptions,
+          {
+            ...authOptions,
+            isGuest: isGuest || !retrySessionToken,
+          },
         );
         if (authStatus?.status === "INSUFFICIENT_POINTS") {
           setError(

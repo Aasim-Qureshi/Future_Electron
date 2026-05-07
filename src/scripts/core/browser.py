@@ -110,6 +110,39 @@ def get_profile_dir():
     return str(path.resolve())
 
 
+def get_secondary_approval_profile_dir():
+    """
+    Isolated Chrome user-data-dir for Taqeem *secondary* (approver) login + approvals.
+    Never shares cookies with the primary Valuer browser (taqeem_chrome_profile).
+    Override with VALUE_TECH_TAQEEM_SECONDARY_APPROVAL_PROFILE_DIR.
+    """
+    override = os.getenv("VALUE_TECH_TAQEEM_SECONDARY_APPROVAL_PROFILE_DIR", "").strip()
+    if override:
+        path = Path(override)
+    elif sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA", "")
+        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        path = base / "ValueTech" / "taqeem_secondary_approval_profile"
+    elif sys.platform == "darwin":
+        path = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "ValueTech"
+            / "taqeem_secondary_approval_profile"
+        )
+    else:
+        path = Path.home() / ".local" / "share" / "valuetech" / "taqeem_secondary_approval_profile"
+
+    path.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[PY] secondary approval profile: {path.resolve()}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return str(path.resolve())
+
+
 async def spawn_new_browser(
     old_browser,
     user_data_dir=None,

@@ -82,6 +82,24 @@ class AuthCommands {
         });
     }
 
+    /**
+     * Dedicated Chrome profile (secondary approver): open visible Chrome, wait for manual
+     * login if needed, then approve each report on qima.taqeem.gov.sa/report/<id>.
+     */
+    async taqeemSecondaryApproveReports(options = {}) {
+        return this._sendCommand({
+            action: 'taqeem-secondary-approve-reports',
+            reportIds: options.reportIds || [],
+            loginUrl: options.loginUrl,
+            waitForLogin: options.waitForLogin !== false,
+            loginTimeoutMs: options.loginTimeoutMs,
+            tabsNum: options.tabsNum,
+            approvalLoadTimeoutMs: options.approvalLoadTimeoutMs,
+            approvalUiDeadlineMs: options.approvalUiDeadlineMs,
+            approvalPollMs: options.approvalPollMs
+        });
+    }
+
     async ping() {
         return this._sendCommand({
             action: 'ping'

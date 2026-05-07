@@ -92,6 +92,7 @@ from scripts.submission.mutliReportFiller import (
 from scripts.submission.registrationCertificateDownloader import (
     download_registration_certificates,
 )
+from scripts.submission.taqeem_secondary_approval import run_secondary_approval_batch
 from scripts.submission.validateReport import validate_report
 
 from .browser import check_browser_status, closeBrowser, get_browser, spawn_new_browser
@@ -189,6 +190,10 @@ async def _process_one_command(cmd):
         return
     # check-status must stay responsive while long jobs (e.g. certificate download) hold the lock.
     if action == "check-status":
+        await _run_command_safe(cmd)
+        return
+    # Secondary Taqeem approvals use a separate Chrome profile; must not block primary automation.
+    if action == "taqeem-secondary-approve-reports":
         await _run_command_safe(cmd)
         return
     async with _command_serial_lock:
@@ -355,6 +360,11 @@ async def handle_command(cmd):
             }
         result["commandId"] = cmd.get("commandId")
 
+        print(json.dumps(result), flush=True)
+
+    elif action == "taqeem-secondary-approve-reports":
+        result = await run_secondary_approval_batch(cmd)
+        result["commandId"] = cmd.get("commandId")
         print(json.dumps(result), flush=True)
 
     elif action == "open-login-page":

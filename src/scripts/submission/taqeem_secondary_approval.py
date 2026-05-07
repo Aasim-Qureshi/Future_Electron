@@ -1,0 +1,433 @@
+"""
+Dedicated Chrome (nodriver) for Taqeem *secondary* user: manual login when needed,
+then parallel approvals across multiple tabs (tabsNum / recommendedTabs style).
+
+Uses its own user-data-dir (see get_secondary_approval_profile_dir) so it never
+touches the primary Valuer automation profile.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import nodriver as uc
+from dotenv import load_dotenv
+
+from scripts.core.browser import get_secondary_approval_profile_dir
+
+QIMA_HOME = "https://qima.taqeem.gov.sa/"
+# ValueTech-Frontend/.env (same depth as taqeem_primary_credentials.py)
+_SECONDARY_ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
+
+
+def chunk_items(items: list[str], n: int) -> list[list[str]]:
+    """Split items into n balanced chunks (one nodriver tab per chunk)."""
+    n = max(1, n)
+    k, m = divmod(len(items), n)
+    chunks: list[list[str]] = []
+    start = 0
+    for i in range(n):
+        size = k + (1 if i < m else 0)
+        chunks.append(items[start : start + size])
+        start += size
+    return chunks
+
+
+def _normalize_report_ids(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, dict):
+            rid = item.get("reportId") or item.get("report_id") or item.get("reportid")
+        else:
+            rid = item
+        s = str(rid or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _qima_app_ready(href: str) -> bool:
+    u = (href or "").lower().strip()
+    if not u.startswith("https://qima.taqeem.gov.sa/"):
+        return False
+    if "keycloak" in u:
+        return False
+    return True
+
+
+def _should_offer_secondary_login_assist(href: str) -> bool:
+    """Same idea as Electron authHandlers.shouldOfferTaqeemLoginAssist (Keycloak / SSO)."""
+    u = (href or "").lower().strip()
+    if u.startswith("https://qima.taqeem.gov.sa/"):
+        return False
+    return "sso.taqeem.gov.sa" in u or "openid-connect" in u
+
+
+def _secondary_login_assist_script(login_id: str, password: str) -> str:
+    lid = json.dumps(login_id)
+    pwd = json.dumps(password)
+    return f"""
+(() => {{
+  const LOGIN_ID = {lid};
+  const PASSWORD = {pwd};
+  if (!LOGIN_ID || !PASSWORD) return {{ "ok": false, "reason": "no_credentials" }};
+
+  window.__vtSecAssist = window.__vtSecAssist || {{ lastClick: 0 }};
+  const now = Date.now();
+  if (now - window.__vtSecAssist.lastClick < 4500) {{
+    return {{ "ok": true, "skipped": true, "reason": "click_throttle" }};
+  }}
+
+  function pickUser() {{
+    return document.querySelector(
+      'input#username, input[name="username"], input[name="login"], input[type="text"][autocomplete="username"]'
+    );
+  }}
+  function pickPass() {{
+    return document.querySelector(
+      'input#password, input[name="password"], input[type="password"]'
+    );
+  }}
+  const userEl = pickUser();
+  const passEl = pickPass();
+  if (!userEl || !passEl) return {{ "ok": false, "reason": "no_fields" }};
+
+  userEl.focus();
+  userEl.value = LOGIN_ID;
+  userEl.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  userEl.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  passEl.value = PASSWORD;
+  passEl.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  passEl.dispatchEvent(new Event("change", {{ bubbles: true }}));
+
+  const btn = document.querySelector(
+    '#kc-login, input[type="submit"][name="login"], button[name="login"], input[name="login"][type="submit"]'
+  );
+  let clicked = false;
+  if (btn && typeof btn.click === "function") {{
+    btn.click();
+    clicked = true;
+    window.__vtSecAssist.lastClick = Date.now();
+  }}
+  try {{
+    const scrollEl = userEl;
+    if (scrollEl && scrollEl.scrollIntoView) {{
+      scrollEl.scrollIntoView({{ block: "center", inline: "nearest", behavior: "auto" }});
+    }}
+  }} catch (e) {{}}
+  return {{ "ok": true, "filled": true, "clicked": clicked }};
+}})()
+"""
+
+
+async def _apply_secondary_login_credentials(page, login_id: str, password: str) -> dict[str, Any]:
+    script = _secondary_login_assist_script(login_id, password)
+    raw = await asyncio.wait_for(page.evaluate(script), timeout=25.0)
+    return raw if isinstance(raw, dict) else {"ok": False, "reason": "bad_eval_result"}
+
+
+async def _read_href(page) -> str:
+    try:
+        return str(await asyncio.wait_for(page.evaluate("window.location.href || ''"), timeout=20.0))
+    except Exception:
+        return ""
+
+
+_APPROVE_POLL_JS = r"""
+() => {
+  const checkbox = document.querySelector(
+    'input#agree, input[name="policy"], input[type="checkbox"][name*="agree" i], input[type="checkbox"][id*="agree" i]'
+  );
+  const confirmBtn = document.querySelector(
+    'input#confirm, button#confirm, input[name="confirm"], button[name="confirm"], input[type="submit"][value*="اعتماد" i], button[type="submit"], button.btn-primary'
+  );
+  if (!checkbox || !confirmBtn) return 'wait';
+  try {
+    checkbox.checked = true;
+    checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+    checkbox.dispatchEvent(new Event('input', { bubbles: true }));
+    confirmBtn.disabled = false;
+    confirmBtn.removeAttribute('disabled');
+    if (typeof confirmBtn.click === 'function') confirmBtn.click();
+    else confirmBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    return 'ok';
+  } catch (e) {
+    return 'err:' + String(e);
+  }
+}
+"""
+
+
+async def _poll_click_approve(page, ui_deadline_s: float, poll_s: float) -> dict:
+    deadline = time.monotonic() + max(5.0, ui_deadline_s)
+    while time.monotonic() < deadline:
+        try:
+            raw = await asyncio.wait_for(page.evaluate(_APPROVE_POLL_JS), timeout=25.0)
+        except Exception as err:
+            raw = "err:" + str(err)
+        if raw == "ok":
+            await asyncio.sleep(0.75)
+            return {"ok": True}
+        if isinstance(raw, str) and raw.startswith("err:"):
+            return {"ok": False, "error": raw[4:]}
+        await asyncio.sleep(poll_s)
+    return {"ok": False, "error": "Timeout waiting for approve controls"}
+
+
+async def run_secondary_approval_batch(cmd: dict) -> dict:
+    """
+    cmd keys:
+      reportIds: list[str|dict]
+      loginUrl (optional)
+      waitForLogin (bool, default True)
+      loginTimeoutMs (int, default 300000)
+      tabsNum: parallel tabs (same idea as batch status check / recommendedTabs)
+      approvalLoadTimeoutMs, approvalUiDeadlineMs, approvalPollMs (optional)
+
+    When waiting for login, fills Keycloak fields from ValueTech-Frontend/.env:
+    TAQEEM_SECONDARY_LOGIN_ID, TAQEEM_SECONDARY_PASSWORD (same keys as Electron assist),
+    then clicks #kc-login once per throttle window; complete OTP / 2FA manually if prompted.
+    """
+    report_ids = _normalize_report_ids(cmd.get("reportIds") or [])
+    if not report_ids:
+        return {"status": "FAILED", "error": "No reportIds for secondary approval", "batch": None}
+
+    wait_for_login = cmd.get("waitForLogin", True) is not False
+    login_timeout_ms = int(cmd.get("loginTimeoutMs") or 300000)
+    load_timeout_s = max(15.0, float(cmd.get("approvalLoadTimeoutMs") or 120000) / 1000.0)
+    ui_deadline_s = max(15.0, float(cmd.get("approvalUiDeadlineMs") or 120000) / 1000.0)
+    poll_s = max(0.2, float(cmd.get("approvalPollMs") or 550) / 1000.0)
+
+    try:
+        tabs_cap = int(os.getenv("TAQEEM_SECONDARY_APPROVAL_MAX_TABS", "16"))
+    except ValueError:
+        tabs_cap = 16
+    tabs_cap = max(1, min(32, tabs_cap))
+    requested = max(1, int(cmd.get("tabsNum") or cmd.get("tabs_num") or 4))
+    stagger_sec = float(os.getenv("TAQEEM_SECONDARY_APPROVAL_STAGGER_SEC", "0.2") or 0.2)
+
+    profile = get_secondary_approval_profile_dir()
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+    )
+
+    browser = None
+    try:
+        print(
+            json.dumps(
+                {
+                    "event": "taqeem-secondary-approval",
+                    "phase": "starting_chrome",
+                    "reports": len(report_ids),
+                    "tabsRequested": requested,
+                }
+            ),
+            flush=True,
+        )
+        browser = await uc.start(
+            user_data_dir=profile,
+            headless=False,
+            browser_args=[
+                f"--user-agent={user_agent}",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no_sandbox",
+                "--disable-popup-blocking",
+                "--disable-features=VizDisplayCompositor",
+                "--lang=ar-SA,en-US",
+                "--no-first-run",
+                "--no-default-browser-check",
+            ],
+            window_size=(1400, 920),
+        )
+        page = browser.main_tab
+        if page is None:
+            page = await browser.get("about:blank")
+
+        await asyncio.wait_for(page.get(QIMA_HOME), timeout=load_timeout_s)
+
+        if wait_for_login:
+            load_dotenv(_SECONDARY_ENV_FILE)
+            login_id = (os.getenv("TAQEEM_SECONDARY_LOGIN_ID") or "").strip()
+            password = (os.getenv("TAQEEM_SECONDARY_PASSWORD") or "").strip()
+            cred_missing_logged = False
+            assist_applied_logged = False
+            login_deadline = time.monotonic() + login_timeout_ms / 1000.0
+            while time.monotonic() < login_deadline:
+                href = await _read_href(page)
+                if _qima_app_ready(href):
+                    break
+                if login_id and password:
+                    if _should_offer_secondary_login_assist(href):
+                        try:
+                            res = await _apply_secondary_login_credentials(
+                                page, login_id, password
+                            )
+                            if (
+                                res.get("ok")
+                                and res.get("filled")
+                                and not assist_applied_logged
+                            ):
+                                assist_applied_logged = True
+                                print(
+                                    json.dumps(
+                                        {
+                                            "event": "taqeem-secondary-approval",
+                                            "phase": "login_fields_filled",
+                                            "clicked": bool(res.get("clicked")),
+                                        }
+                                    ),
+                                    flush=True,
+                                )
+                        except Exception as err:
+                            print(
+                                json.dumps(
+                                    {
+                                        "event": "taqeem-secondary-approval",
+                                        "phase": "login_assist_error",
+                                        "error": str(err),
+                                    }
+                                ),
+                                flush=True,
+                            )
+                elif (
+                    _should_offer_secondary_login_assist(href)
+                    and not cred_missing_logged
+                ):
+                    cred_missing_logged = True
+                    print(
+                        json.dumps(
+                            {
+                                "event": "taqeem-secondary-approval",
+                                "phase": "login_credentials_missing",
+                                "hint": "Set TAQEEM_SECONDARY_LOGIN_ID and TAQEEM_SECONDARY_PASSWORD in .env",
+                            }
+                        ),
+                        flush=True,
+                    )
+                await asyncio.sleep(0.75)
+            else:
+                return {
+                    "status": "FAILED",
+                    "error": "Timed out waiting for Taqeem login in secondary Chrome. "
+                    "Complete login in the opened window and run approval again.",
+                    "batch": {
+                        "total": len(report_ids),
+                        "succeeded": 0,
+                        "failed": len(report_ids),
+                        "results": [
+                            {
+                                "reportId": rid,
+                                "status": "FAILED",
+                                "error": "Not logged in (timeout)",
+                            }
+                            for rid in report_ids
+                        ],
+                    },
+                }
+
+        effective_tabs = min(len(report_ids), requested, tabs_cap)
+        print(
+            json.dumps(
+                {
+                    "event": "taqeem-secondary-approval",
+                    "phase": "parallel_tabs",
+                    "effectiveTabs": effective_tabs,
+                    "tabsCap": tabs_cap,
+                }
+            ),
+            flush=True,
+        )
+
+        pages = [page]
+        for _ in range(max(0, effective_tabs - 1)):
+            try:
+                extra = await asyncio.wait_for(
+                    browser.get("about:blank", new_tab=True),
+                    timeout=30.0,
+                )
+                if extra is not None:
+                    pages.append(extra)
+            except Exception:
+                break
+
+        chunks = chunk_items(report_ids, len(pages))
+
+        async def approve_one(tab, rid: str) -> dict:
+            url = f"https://qima.taqeem.gov.sa/report/{rid}"
+            try:
+                await asyncio.wait_for(tab.get(url), timeout=load_timeout_s)
+                await asyncio.sleep(0.28)
+                ap = await _poll_click_approve(tab, ui_deadline_s, poll_s)
+                if ap.get("ok"):
+                    return {"reportId": rid, "status": "SUCCESS"}
+                return {
+                    "reportId": rid,
+                    "status": "FAILED",
+                    "error": ap.get("error") or "Approve click failed",
+                }
+            except Exception as err:
+                return {
+                    "reportId": rid,
+                    "status": "FAILED",
+                    "error": str(err) or type(err).__name__,
+                }
+
+        async def process_chunk(tab, chunk: list[str], worker_index: int) -> list[dict]:
+            await asyncio.sleep(max(0.0, stagger_sec) * worker_index)
+            out: list[dict] = []
+            for rid in chunk:
+                out.append(await approve_one(tab, rid))
+                await asyncio.sleep(0.08)
+            return out
+
+        parts = await asyncio.gather(
+            *(process_chunk(p, c, i) for i, (p, c) in enumerate(zip(pages, chunks)))
+        )
+        merged: dict[str, dict] = {}
+        for part in parts:
+            for row in part:
+                merged[str(row["reportId"])] = row
+        results = [merged[rid] for rid in report_ids if rid in merged]
+
+        succeeded = sum(1 for r in results if r.get("status") == "SUCCESS")
+        failed = len(results) - succeeded
+        batch = {
+            "total": len(results),
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": results,
+        }
+        return {
+            "status": "SUCCESS",
+            "message": f"Secondary Chrome approvals finished: {succeeded}/{len(results)} OK",
+            "batch": batch,
+        }
+    finally:
+        if browser is not None:
+            try:
+                browser.stop()
+            except Exception as err:
+                print(
+                    json.dumps(
+                        {
+                            "event": "taqeem-secondary-approval",
+                            "phase": "browser_stop_warn",
+                            "error": str(err),
+                        }
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
