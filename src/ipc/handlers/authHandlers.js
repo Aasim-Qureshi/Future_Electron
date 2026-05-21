@@ -558,7 +558,7 @@ const authHandlers = {
             token,
             name = 'refreshToken',
             path = '/',
-            maxAgeDays = 365 * 100,
+            maxAgeDays = 1,
             sessionOnly = false,
             sameSite = 'lax',
             secure = (process.env.NODE_ENV === 'production'),

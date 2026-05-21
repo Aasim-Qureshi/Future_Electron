@@ -91,7 +91,7 @@ const resolvePreferredCompanyStorageKey = (user, isGuest) => {
 };
 
 export const ValueNavProvider = ({ children }) => {
-    const { user, token, isGuest } = useSession();
+    const { user, token, isGuest, updateUser } = useSession();
     const { t } = useTranslation();
     const { taqeemStatus, setCompanyStatus, setTaqeemStatus } = useNavStatus();
     const [selectedCard, setSelectedCard] = useState(null);
@@ -388,11 +388,46 @@ export const ValueNavProvider = ({ children }) => {
             });
             setCompanies(fetched);
             if (user && token && window.electronAPI.apiRequest) {
+                let profileData = null;
+                let taqeemUser = '';
+                if (window?.electronAPI?.getTaqeemProfile) {
+                    try {
+                        const profileRes = await window.electronAPI.getTaqeemProfile();
+                        if (profileRes?.status === 'SUCCESS') {
+                            profileData = profileRes.data || null;
+                            taqeemUser = String(
+                                profileData?.taqeemUser ||
+                                profileData?.user_id ||
+                                profileData?.username ||
+                                ''
+                            ).trim();
+                        }
+                    } catch (profileErr) {
+                        console.warn('[Companies] profile fetch for Taqeem sync failed', profileErr);
+                    }
+                }
+
                 try {
-                    await syncCompanies(
-                        fetched.map((c) => ({ ...c, type: c.type || 'equipment' })),
-                        'equipment'
-                    );
+                    if (taqeemUser) {
+                        const syncResponse = await window.electronAPI.apiRequest(
+                            'POST',
+                            '/api/users/taqeem/sync',
+                            {
+                                taqeemUser,
+                                profile: profileData,
+                                companies: fetched.map((c) => ({ ...c, type: c.type || 'equipment' }))
+                            },
+                            authHeaders
+                        );
+                        if (syncResponse?.user && updateUser) {
+                            updateUser(syncResponse.user);
+                        }
+                    } else {
+                        await syncCompanies(
+                            fetched.map((c) => ({ ...c, type: c.type || 'equipment' })),
+                            'equipment'
+                        );
+                    }
                 } catch (syncErr) {
                     console.warn('[Companies] sync to server failed', syncErr);
                 }
@@ -409,7 +444,7 @@ export const ValueNavProvider = ({ children }) => {
         } finally {
             setLoadingCompanies(false);
         }
-    }, [user, token, syncCompanies, t, setCompanyStatus]);
+    }, [authHeaders, user, token, syncCompanies, t, setCompanyStatus, updateUser]);
 
     useEffect(() => {
         if (user && token) {

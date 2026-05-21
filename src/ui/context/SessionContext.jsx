@@ -5,22 +5,15 @@ import React, {
   useEffect,
   useCallback,
 } from "react";
-import { isAccessTokenValid } from "../utils/accessToken";
+import { decodeJwtPayload, isAccessTokenValid } from "../utils/accessToken";
 
 const SessionContext = createContext();
 const USER_STORAGE_KEY = "user";
 const TOKEN_STORAGE_KEY = "token";
-/** رقم المستخدم المحلي الثابت في التطبيق (ليس "ضيفًا" من واجهة المستخدم) */
-export const LOCAL_APP_USER_PHONE = "000";
-const LOCAL_USER_PHONE = LOCAL_APP_USER_PHONE;
-/** بعد تسجيل الخروج: لا تُستعاد جلسة الضيف تلقائيًا حتى يمرّ المستخدم بفورم الدخول المحلي */
+const SESSION_META_STORAGE_KEY = "vt:appSession";
 const REQUIRE_LOCAL_APP_LOGIN_KEY = "vt:requireLocalAppLogin";
-
-const buildLocalSingleUser = () => ({
-  id: LOCAL_USER_PHONE,
-  phone: LOCAL_USER_PHONE,
-  guest: true,
-});
+const LEGACY_FIXED_APP_PHONE = "000";
+const APP_SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const getSessionStorage = () => {
   if (typeof window === "undefined") return null;
@@ -50,7 +43,62 @@ const safeSet = (storage, key, value) => {
   }
 };
 
-/** Auth survives Electron restarts: primary store is localStorage; sessionStorage is legacy. */
+const getTokenTimestampMs = (token, claim) => {
+  const payload = decodeJwtPayload(token);
+  const value = Number(payload?.[claim]);
+  return Number.isFinite(value) && value > 0 ? value * 1000 : null;
+};
+
+const buildSessionMeta = (token, now = Date.now()) => {
+  const issuedAt = getTokenTimestampMs(token, "iat") || now;
+  const tokenExpiresAt = getTokenTimestampMs(token, "exp");
+  const sessionExpiresAt = issuedAt + APP_SESSION_MAX_AGE_MS;
+  return {
+    issuedAt,
+    expiresAt: tokenExpiresAt
+      ? Math.min(tokenExpiresAt, sessionExpiresAt)
+      : sessionExpiresAt,
+  };
+};
+
+const readSessionMeta = (localRef, sessionRef) => {
+  const raw =
+    localRef?.getItem(SESSION_META_STORAGE_KEY) ||
+    sessionRef?.getItem(SESSION_META_STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    const issuedAt = Number(parsed?.issuedAt);
+    const expiresAt = Number(parsed?.expiresAt);
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) return null;
+    return {
+      issuedAt:
+        Number.isFinite(issuedAt) && issuedAt > 0 ? issuedAt : expiresAt,
+      expiresAt,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const resolveSessionMeta = (token, existingMeta = null, now = Date.now()) => {
+  const tokenMeta = buildSessionMeta(token, now);
+  if (!existingMeta) return tokenMeta;
+  return {
+    issuedAt: existingMeta.issuedAt || tokenMeta.issuedAt,
+    expiresAt: Math.min(existingMeta.expiresAt, tokenMeta.expiresAt),
+  };
+};
+
+const isSessionMetaValid = (meta, now = Date.now()) =>
+  Boolean(meta?.expiresAt && meta.expiresAt > now);
+
+const persistSessionMeta = (localRef, sessionRef, meta) => {
+  if (!meta) return;
+  safeSet(localRef, SESSION_META_STORAGE_KEY, JSON.stringify(meta));
+  safeRemove(sessionRef, SESSION_META_STORAGE_KEY);
+};
+
 const persistAuthKeys = (localRef, sessionRef, userJson, tokenValue) => {
   if (userJson != null) {
     safeSet(localRef, USER_STORAGE_KEY, userJson);
@@ -65,9 +113,21 @@ const persistAuthKeys = (localRef, sessionRef, userJson, tokenValue) => {
 const clearAllAuthKeys = (localRef, sessionRef) => {
   safeRemove(localRef, USER_STORAGE_KEY);
   safeRemove(localRef, TOKEN_STORAGE_KEY);
+  safeRemove(localRef, SESSION_META_STORAGE_KEY);
   safeRemove(sessionRef, USER_STORAGE_KEY);
   safeRemove(sessionRef, TOKEN_STORAGE_KEY);
+  safeRemove(sessionRef, SESSION_META_STORAGE_KEY);
 };
+
+const normalizeUserForSession = (userData) => {
+  if (!userData || typeof userData !== "object") return null;
+  return userData;
+};
+
+const isLegacyFixedGuestSession = (userData) =>
+  Boolean(userData?.guest) &&
+  (String(userData?.phone || "").trim() === LEGACY_FIXED_APP_PHONE ||
+    String(userData?.id || "").trim() === LEGACY_FIXED_APP_PHONE);
 
 export const useSession = () => {
   const context = useContext(SessionContext);
@@ -85,8 +145,9 @@ export const SessionProvider = ({ children }) => {
   const [sessionHydrated, setSessionHydrated] = useState(false);
   const [authBootstrapPending, setAuthBootstrapPending] = useState(false);
   const [blockSilentGuest, setBlockSilentGuest] = useState(false);
+  const [sessionExpiresAt, setSessionExpiresAt] = useState(null);
 
-  const clearPersistedRefreshToken = async () => {
+  const clearPersistedRefreshToken = useCallback(async () => {
     if (!window?.electronAPI?.clearRefreshToken) return;
 
     const env =
@@ -94,8 +155,8 @@ export const SessionProvider = ({ children }) => {
     const candidateBaseUrls = [
       env.BACKEND_URL,
       env.REACT_APP_BACKEND_URL,
-      "http://localhost:3000",
-      "http://127.0.0.1:3000",
+      "http://localhost:3001",
+      "http://127.0.0.1:3001",
     ].filter(Boolean);
 
     const uniqueBaseUrls = Array.from(new Set(candidateBaseUrls));
@@ -107,38 +168,32 @@ export const SessionProvider = ({ children }) => {
         }),
       ),
     );
-  };
-
-  const bootstrapGuestSession = useCallback(async () => {
-    if (!window?.electronAPI?.apiRequest) return null;
-    const result = await window.electronAPI.apiRequest(
-      "POST",
-      "/api/users/guest",
-      {},
-      {},
-    );
-    const access = result?.token || result?.refreshToken;
-    const apiUser = result?.user;
-    const localRef = getLocalStorage();
-    const sessionRef = getSessionStorage();
-    if (access) {
-      safeRemove(localRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
-      safeRemove(sessionRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
-      setToken(access);
-      setBlockSilentGuest(false);
-      persistAuthKeys(localRef, sessionRef, null, access);
-    }
-    if (apiUser && typeof apiUser === "object") {
-      const merged = {
-        ...apiUser,
-        phone: LOCAL_USER_PHONE,
-        guest: true,
-      };
-      setUser(merged);
-      persistAuthKeys(localRef, sessionRef, JSON.stringify(merged), null);
-    }
-    return access || null;
   }, []);
+
+  const clearCurrentSession = useCallback(
+    (requireLocalAppLogin = true) => {
+      const localRef = getLocalStorage();
+      const sessionRef = getSessionStorage();
+
+      setToken(null);
+      setUser(null);
+      setIsGuest(false);
+      setSessionExpiresAt(null);
+      setBlockSilentGuest(requireLocalAppLogin);
+      clearAllAuthKeys(localRef, sessionRef);
+
+      if (requireLocalAppLogin) {
+        safeSet(localRef, REQUIRE_LOCAL_APP_LOGIN_KEY, "1");
+        safeSet(sessionRef, REQUIRE_LOCAL_APP_LOGIN_KEY, "1");
+      } else {
+        safeRemove(localRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
+        safeRemove(sessionRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
+      }
+
+      void clearPersistedRefreshToken();
+    },
+    [clearPersistedRefreshToken],
+  );
 
   useEffect(() => {
     const sessionRef = getSessionStorage();
@@ -149,14 +204,13 @@ export const SessionProvider = ({ children }) => {
       sessionRef?.getItem(REQUIRE_LOCAL_APP_LOGIN_KEY) === "1";
 
     if (requireLocalAppLogin) {
-      safeRemove(localRef, USER_STORAGE_KEY);
-      safeRemove(sessionRef, USER_STORAGE_KEY);
-      safeRemove(localRef, TOKEN_STORAGE_KEY);
-      safeRemove(sessionRef, TOKEN_STORAGE_KEY);
+      clearAllAuthKeys(localRef, sessionRef);
       setUser(null);
       setIsGuest(false);
       setToken(null);
+      setSessionExpiresAt(null);
       setBlockSilentGuest(true);
+      void clearPersistedRefreshToken();
       setIsLoading(false);
       return;
     }
@@ -164,120 +218,108 @@ export const SessionProvider = ({ children }) => {
     const savedUserJson =
       localRef?.getItem(USER_STORAGE_KEY) ||
       sessionRef?.getItem(USER_STORAGE_KEY);
-    let savedToken =
+    const savedToken =
       localRef?.getItem(TOKEN_STORAGE_KEY) ||
       sessionRef?.getItem(TOKEN_STORAGE_KEY);
 
-    let restoredUser = false;
+    const hasValidSavedToken =
+      savedToken &&
+      savedToken !== "undefined" &&
+      savedToken !== "null" &&
+      isAccessTokenValid(savedToken);
+    const savedSessionMeta = hasValidSavedToken
+      ? resolveSessionMeta(savedToken, readSessionMeta(localRef, sessionRef))
+      : null;
+    const hasValidSavedSession = isSessionMetaValid(savedSessionMeta);
 
-    if (savedUserJson) {
+    if (hasValidSavedToken && hasValidSavedSession && savedUserJson) {
+      let parsedUser = null;
       try {
-        const parsed = JSON.parse(savedUserJson);
-        if (typeof parsed === "string") {
-          setUser({ ...buildLocalSingleUser(), id: parsed });
-          setIsGuest(true);
-        } else {
-          setUser(parsed);
-          const guestish =
-            Boolean(parsed?.guest) ||
-            !parsed?.phone ||
-            String(parsed.phone) === LOCAL_USER_PHONE;
-          setIsGuest(guestish);
-        }
-        restoredUser = true;
-        persistAuthKeys(localRef, sessionRef, savedUserJson, null);
+        parsedUser = normalizeUserForSession(JSON.parse(savedUserJson));
       } catch (e) {
         console.error("Failed to parse saved user:", e);
         safeRemove(localRef, USER_STORAGE_KEY);
         safeRemove(sessionRef, USER_STORAGE_KEY);
       }
-    }
 
-    if (!restoredUser) {
-      const local = buildLocalSingleUser();
-      setUser(local);
-      setIsGuest(true);
-      persistAuthKeys(localRef, sessionRef, JSON.stringify(local), null);
-    }
-
-    if (savedToken && savedToken !== "undefined" && savedToken !== "null") {
-      if (isAccessTokenValid(savedToken)) {
+      if (parsedUser && !isLegacyFixedGuestSession(parsedUser)) {
         setToken(savedToken);
-        persistAuthKeys(localRef, sessionRef, null, savedToken);
+        setUser(parsedUser);
+        setIsGuest(Boolean(parsedUser?.guest));
+        setSessionExpiresAt(savedSessionMeta.expiresAt);
+        setBlockSilentGuest(false);
+        persistAuthKeys(localRef, sessionRef, savedUserJson, savedToken);
+        persistSessionMeta(localRef, sessionRef, savedSessionMeta);
       } else {
-        setBlockSilentGuest(true);
-        safeRemove(localRef, TOKEN_STORAGE_KEY);
-        safeRemove(sessionRef, TOKEN_STORAGE_KEY);
+        clearAllAuthKeys(localRef, sessionRef);
         setToken(null);
+        setUser(null);
+        setIsGuest(false);
+        setSessionExpiresAt(null);
+        setBlockSilentGuest(true);
+        void clearPersistedRefreshToken();
+      }
+    } else {
+      clearAllAuthKeys(localRef, sessionRef);
+      setToken(null);
+      setUser(null);
+      setIsGuest(false);
+      setSessionExpiresAt(null);
+      setBlockSilentGuest(true);
+      if (savedToken || savedUserJson) {
+        void clearPersistedRefreshToken();
       }
     }
 
     setIsLoading(false);
-  }, []);
+  }, [clearPersistedRefreshToken]);
 
   useEffect(() => {
     if (isLoading) return;
 
-    let cancelled = false;
+    const hasActiveSession =
+      sessionExpiresAt && sessionExpiresAt > Date.now();
 
-    (async () => {
-      if (blockSilentGuest && !token) {
-        setSessionHydrated(true);
-        setAuthBootstrapPending(false);
-        return;
-      }
+    if (token && isAccessTokenValid(token) && hasActiveSession) {
+      setSessionHydrated(true);
+      setAuthBootstrapPending(false);
+      return;
+    }
 
-      if (token && isAccessTokenValid(token)) {
-        setSessionHydrated(true);
-        setAuthBootstrapPending(false);
-        return;
-      }
+    setSessionHydrated(true);
+    setAuthBootstrapPending(false);
+  }, [isLoading, token, sessionExpiresAt, blockSilentGuest]);
 
-      if (!window?.electronAPI?.apiRequest) {
-        setSessionHydrated(true);
-        setAuthBootstrapPending(false);
-        return;
-      }
+  useEffect(() => {
+    if (isLoading || !sessionExpiresAt) return undefined;
 
-      setAuthBootstrapPending(true);
-      try {
-        await bootstrapGuestSession();
-      } catch (err) {
-        console.warn("[Session] guest bootstrap skipped:", err?.message || err);
-      } finally {
-        if (!cancelled) {
-          setAuthBootstrapPending(false);
-          setSessionHydrated(true);
-        }
-      }
-    })();
+    const remainingMs = sessionExpiresAt - Date.now();
+    if (remainingMs <= 0) {
+      clearCurrentSession(true);
+      return undefined;
+    }
 
-    return () => {
-      cancelled = true;
-    };
-  }, [isLoading, token, bootstrapGuestSession, blockSilentGuest]);
+    const timeoutId = window.setTimeout(() => {
+      clearCurrentSession(true);
+    }, remainingMs);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [clearCurrentSession, isLoading, sessionExpiresAt]);
 
   const login = (userData, accessToken) => {
     const localRef = getLocalStorage();
     const sessionRef = getSessionStorage();
-
-    let normalizedUser = userData;
-    let guestFlag = false;
-
-    if (typeof userData === "string") {
-      normalizedUser = { id: userData, guest: true };
-      guestFlag = true;
-    } else if (userData?.guest) {
-      guestFlag = true;
-    }
+    const normalizedUser = normalizeUserForSession(userData);
 
     setUser(normalizedUser);
-    setIsGuest(guestFlag);
+    setIsGuest(Boolean(normalizedUser?.guest));
 
     if (accessToken) {
       safeRemove(localRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
       safeRemove(sessionRef, REQUIRE_LOCAL_APP_LOGIN_KEY);
       setToken(accessToken);
+      const sessionMeta = buildSessionMeta(accessToken);
+      setSessionExpiresAt(sessionMeta.expiresAt);
       setBlockSilentGuest(false);
       persistAuthKeys(
         localRef,
@@ -285,8 +327,10 @@ export const SessionProvider = ({ children }) => {
         JSON.stringify(normalizedUser),
         accessToken,
       );
+      persistSessionMeta(localRef, sessionRef, sessionMeta);
     } else {
       setToken(null);
+      setSessionExpiresAt(null);
       persistAuthKeys(
         localRef,
         sessionRef,
@@ -295,31 +339,28 @@ export const SessionProvider = ({ children }) => {
       );
       safeRemove(localRef, TOKEN_STORAGE_KEY);
       safeRemove(sessionRef, TOKEN_STORAGE_KEY);
+      safeRemove(localRef, SESSION_META_STORAGE_KEY);
+      safeRemove(sessionRef, SESSION_META_STORAGE_KEY);
     }
   };
 
-  const logout = () => {
-    const localRef = getLocalStorage();
-    const sessionRef = getSessionStorage();
-
-    setToken(null);
-    setUser(null);
-    setIsGuest(false);
-    setBlockSilentGuest(true);
-    clearAllAuthKeys(localRef, sessionRef);
-    safeSet(localRef, REQUIRE_LOCAL_APP_LOGIN_KEY, "1");
-    safeSet(sessionRef, REQUIRE_LOCAL_APP_LOGIN_KEY, "1");
-    void clearPersistedRefreshToken();
-  };
+  const logout = useCallback(() => {
+    clearCurrentSession(true);
+  }, [clearCurrentSession]);
 
   const updateUser = (userData) => {
     const localRef = getLocalStorage();
     const sessionRef = getSessionStorage();
+    const normalizedUser = normalizeUserForSession(userData);
 
-    setUser(userData);
-    setIsGuest(Boolean(userData?.guest));
-    persistAuthKeys(localRef, sessionRef, JSON.stringify(userData), null);
+    setUser(normalizedUser);
+    setIsGuest(Boolean(normalizedUser?.guest));
+    persistAuthKeys(localRef, sessionRef, JSON.stringify(normalizedUser), null);
   };
+
+  const hasActiveSession = Boolean(
+    sessionExpiresAt && sessionExpiresAt > Date.now(),
+  );
 
   return (
     <SessionContext.Provider
@@ -329,11 +370,13 @@ export const SessionProvider = ({ children }) => {
         isLoading,
         sessionHydrated,
         authBootstrapPending,
-        bootstrapGuestSession,
         login,
         logout,
         updateUser,
-        isAuthenticated: !!user,
+        sessionExpiresAt,
+        isAuthenticated: Boolean(
+          user && token && isAccessTokenValid(token) && hasActiveSession,
+        ),
         isGuest,
       }}
     >

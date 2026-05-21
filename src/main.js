@@ -423,7 +423,7 @@ function createWindow() {
 
 // Electron app event handlers
 app.whenReady().then(async () => {
-  // Keep Electron session cookies (e.g. refreshToken) across restarts so users stay signed in.
+  // Keep Electron session cookies across restarts until their configured expiry.
   // Logout from the renderer still clears cookies via IPC.
 
   // Register IPC handlers BEFORE creating window to avoid race conditions

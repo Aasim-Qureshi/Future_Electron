@@ -251,11 +251,24 @@ async function bootstrapAndSync({
     });
     setTaqeemStatus?.("success", "Taqeem login: On");
 
-    const resolvedTaqeemUser = String(
-        loginFlow?.user_id || fallbackTaqeemUser || ""
+    let profileData = cachedSnapshot.profile;
+    let resolvedTaqeemUser = String(
+        loginFlow?.user_id || fallbackTaqeemUser || extractTaqeemUsername(profileData) || ""
     ).trim();
-    // public_login_flow intentionally returns user_id=null after manual CHECK login.
-    // Do not block automation or show a fake "phone login" conflict — server link is optional.
+
+    if (!resolvedTaqeemUser && window?.electronAPI?.getTaqeemProfile) {
+        try {
+            const profileRes = await window.electronAPI.getTaqeemProfile();
+            if (profileRes?.status === "SUCCESS") {
+                profileData = profileRes.data || null;
+                resolvedTaqeemUser = extractTaqeemUsername(profileData);
+            }
+        } catch (err) {
+            console.warn("[taqeemAuth] profile fetch after Taqeem login failed:", err?.message || err);
+        }
+    }
+
+    // If Taqeem does not expose a username, keep automation available and skip only the server link.
     if (!resolvedTaqeemUser) {
         console.info(
             "[taqeemAuth] bootstrapAndSync: Taqeem CHECK login OK but no username in worker/cache; skipping new-bootstrap/sync.",
@@ -323,10 +336,10 @@ async function bootstrapAndSync({
         token: resolvedToken,
         taqeemUser: resolvedTaqeemUser,
         selectedCompanyOfficeId,
-        profileData: cachedSnapshot.profile,
+        profileData,
         companies: cachedSnapshot.companies,
         cachedUser: cachedSnapshot.user,
-        skipProfileFetch: Boolean(cachedSnapshot.profile),
+        skipProfileFetch: Boolean(profileData),
         skipCompaniesFetch: Array.isArray(cachedSnapshot.companies) && cachedSnapshot.companies.length > 0,
     });
 

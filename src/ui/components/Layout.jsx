@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import { getHealth } from '../../api/health';
 import buildVersion from '../../../build-version.json';
-import { useSession, LOCAL_APP_USER_PHONE } from '../context/SessionContext';
+import { useSession } from '../context/SessionContext';
 import { useSystemControl } from '../context/SystemControlContext';
 import { useNavStatus } from '../context/NavStatusContext';
 import { useValueNav } from '../context/ValueNavContext';
@@ -32,12 +32,12 @@ import navigation from '../constants/navigation';
 import { useTranslation } from 'react-i18next';
 import usePersistentState from '../hooks/usePersistentState';
 import { TAQEEM_CONFLICT_EVENT } from '../../shared/helper/taqeemSync';
-import { canAccessGroup, filterTabsByAccess } from '../utils/viewAccess';
+import { canAccessGroup, filterTabsByAccess, isSuperAdminUser } from '../utils/viewAccess';
 const { viewTitles, valueSystemGroups, findTabInfo, valueSystemCards, isValueSystemView, DEFAULT_HOME_VIEW } = navigation;
 const API_BASE_URL = (
     (typeof process !== 'undefined' && process?.env?.REACT_APP_BACKEND_URL) ||
     (typeof process !== 'undefined' && process?.env?.BACKEND_URL) ||
-    'http://localhost:3000'
+    'http://localhost:3001'
 );
 
 const findCardForGroup = (groupId) =>
@@ -226,7 +226,7 @@ const Layout = ({ children, currentView, onViewChange }) => {
         return Number.isFinite(numeric) ? numberFormatter.format(numeric) : value;
     };
 
-    const isAdmin = user?.phone === '000';
+    const isAdmin = isSuperAdminUser(user);
     const blocked = isAuthenticated && (isFeatureBlocked(currentView) || updateBlocked());
     const blockMessage = blockReason(currentView);
     const mode = systemState?.mode || 'active';
@@ -750,7 +750,7 @@ const Layout = ({ children, currentView, onViewChange }) => {
                 });
             }
 
-            if (refreshCompaniesFromTaqeem && (!companies || companies.length === 0)) {
+            if (refreshCompaniesFromTaqeem) {
                 void refreshCompaniesFromTaqeem().catch((err) => {
                     console.warn('Refreshing companies after Taqeem reconnect failed:', err);
                 });
@@ -880,7 +880,7 @@ const Layout = ({ children, currentView, onViewChange }) => {
     const isUltraCompactNav = viewportWidth < 1450;
     const isSidebarOverlay = viewportWidth < 1200;
     const isMobileNav = viewportWidth < 980;
-    const betaVersionLabel = currentLangCode === 'ar' ? 'نسخة بيتا 1.0.0' : 'Beta v1.0.0';
+    const betaVersionLabel = currentLangCode === 'ar' ? 'نسخة بيتا 1.1.0' : 'Beta v1.1.0';
     const sidebarDrawerEdge = uiDir === 'rtl' ? 'right-0' : 'left-0';
     const sidebarDrawerHidden = uiDir === 'rtl' ? 'translate-x-full' : '-translate-x-full';
 
@@ -888,15 +888,6 @@ const Layout = ({ children, currentView, onViewChange }) => {
 
     const userDisplayName = useMemo(() => {
         if (!user) return '';
-        const phoneStr = user.phone != null ? String(user.phone) : '';
-        const isFixedAppUser =
-            phoneStr === LOCAL_APP_USER_PHONE ||
-            String(user.id ?? '') === LOCAL_APP_USER_PHONE;
-        if (isFixedAppUser) {
-            return t('layout.nav.fixedAppUser', {
-                defaultValue: currentLangCode === 'ar' ? 'مستخدم التطبيق (٠٠٠)' : 'App user (000)'
-            });
-        }
         if (isGuest) {
             return t('layout.nav.guestUser', { defaultValue: 'Guest' });
         }
@@ -911,7 +902,7 @@ const Layout = ({ children, currentView, onViewChange }) => {
             '';
         const s = String(raw).trim();
         return s || t('layout.nav.userFallback', { defaultValue: 'User' });
-    }, [user, isGuest, t, currentLangCode]);
+    }, [user, isGuest, t]);
 
     /** رقم الهاتف للعرض بجانب تغيير اللغة (اتجاه LTR للأرقام). */
     const userProfilePhone = useMemo(() => {

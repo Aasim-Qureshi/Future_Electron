@@ -89,7 +89,7 @@
         "nav": {
             "deviceCapability": "Device Capability",
             "memoryRead": "Memory Read",
-            "fixedAppUser": "App user (000)",
+            "fixedAppUser": "App user",
             "guestUser": "Guest",
             "userFallback": "User",
             "userChipOpenSettings": "Open settings"
@@ -894,7 +894,7 @@
                 "noIssues": "No asset issues detected."
             },
             "footerHint": "Close this panel after reviewing the issues.",
-            "footerContinueHint": "Continue to Step 2 (optional report info), then Step 3 (optional PDF), and finally Step 4 action.",
+            "footerContinueHint": "Continue to Step 2 (optional report info), then Step 3 to use the placeholder PDF, and finally Step 4 action.",
             "panelHeader": "Validation on Excel sheet",
             "step2": {
                 "badge": "Step 2 (Optional)",
@@ -905,12 +905,14 @@
                 "back": "Back to validation",
                 "pdfSection": {
                     "badgeOptional": "Step 3 (Optional)",
-                    "title": "Step 3: Attach PDF files (optional)",
-                    "subtitle": "You can upload matching PDF files now, or skip and use the placeholder PDF automatically.",
+                    "title": "Step 3: Use placeholder PDF",
+                    "subtitle": "PDF upload from the app is disabled. The app will use the placeholder PDF automatically.",
                     "modeUpload": "Upload mode",
                     "modePlaceholder": "Placeholder mode",
                     "usePlaceholder": "Use placeholder PDF",
                     "usePlaceholderHint": "Skip manual PDF upload and use the bundled placeholder file.",
+                    "taqeemNoticeTitle": "Upload the PDF from Taqeem",
+                    "taqeemNotice": "After creating the reports, update the report data in Taqeem and upload the actual report PDF directly from the Taqeem system.",
                     "uploadPdfs": "Upload PDF files",
                     "uploadPdfsHint": "Upload PDF files with names matching the Excel filenames.",
                     "chooseButton": "Choose PDF files",

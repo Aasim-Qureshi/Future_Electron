@@ -8,7 +8,12 @@ import httpx
 # Configuration
 # ==============================
 
-BASE_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:3000/api")
+_backend_url = (os.getenv("BACKEND_API_URL") or "").strip()
+if not _backend_url:
+    base = (os.getenv("BACKEND_URL") or "http://localhost:3001").rstrip("/")
+    _backend_url = f"{base}/api"
+
+BASE_API_URL = _backend_url
 
 # ==============================
 # Errors

@@ -40,7 +40,6 @@ import {
 } from "../../api/report";
 import {
   ensureTaqeemAuthorized,
-  extractTaqeemUsernameFromUser,
   isTaqeemAuthSuccess,
 } from "../../shared/helper/taqeemAuthWrap";
 import { deductPoints } from "../utils/points";
@@ -142,6 +141,9 @@ const ALLOWED_REPORT_FILTERS = new Set([
 ]);
 const QUICK_PAGE_NAME = "Submit Reports Quickly";
 const QUICK_PAGE_SOURCE = "submit-reports-quickly";
+const TAQEEM_HOME_URL = "https://qima.taqeem.gov.sa/valuer/home";
+const TAQEEM_BROWSER_READY_TIMEOUT_MS = 45000;
+const TAQEEM_BROWSER_READY_POLL_MS = 1000;
 const DEFAULT_REPORT_INFO_FORM = {
   title: "",
   client_name: "",
@@ -154,6 +156,11 @@ const DEFAULT_REPORT_INFO_FORM = {
 
 const getTaqeemAuthErrorMessage = (authStatus, fallback) =>
   authStatus?.error || authStatus?.message || fallback;
+
+const isTaqeemBrowserReadyStatus = (status) => {
+  const statusCode = String(status?.status || "").toUpperCase();
+  return Boolean(status?.browserOpen && statusCode.includes("SUCCESS"));
+};
 
 const ASSET_USAGE_TEXT_TO_ID = {
   زراعي: 38,
@@ -849,10 +856,29 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     ensureCompaniesLoaded,
     setSelectedCompany,
   } = useValueNav();
-  const taqeemLinked = Boolean(extractTaqeemUsernameFromUser(user || {}));
   const selectedCompanyOfficeId = useMemo(() => {
     const officeId = selectedCompany?.officeId || selectedCompany?.office_id;
     return officeId ? String(officeId) : "";
+  }, [selectedCompany]);
+  const quickCompanyContext = useMemo(() => {
+    if (!selectedCompany) return null;
+    const officeId = selectedCompany.officeId || selectedCompany.office_id;
+    const sectorId = selectedCompany.sectorId || selectedCompany.sector_id;
+    const url =
+      String(selectedCompany.url || "").trim() ||
+      (officeId != null && String(officeId).trim()
+        ? `https://qima.taqeem.gov.sa/organization/show/${officeId}`
+        : "");
+
+    if (!officeId || !url) return null;
+
+    return {
+      name: selectedCompany.name,
+      url,
+      officeId: String(officeId),
+      sectorId: sectorId != null ? String(sectorId) : undefined,
+      skipNavigation: true,
+    };
   }, [selectedCompany]);
   const { ramInfo } = useRam();
   const recommendedTabs = ramInfo?.recommendedTabs || 3;
@@ -930,16 +956,94 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
   const [excelIconSrc, setExcelIconSrc] = useState(excelIconFallback);
 
   const excelInputRef = useRef(null);
-  const pdfInputRef = useRef(null);
   const reportCreationWaitersRef = useRef(new Map());
   const reportCreatedCacheRef = useRef(new Map());
   const pendingCompanySelectionRef = useRef(null);
   const isTaqeemLoggedIn = taqeemStatus?.state === "success";
 
+  const persistQuickCompanyContext = useCallback(async () => {
+    if (!quickCompanyContext) {
+      throw new Error(
+        translate(
+          "messages.error.companyRequiredForUpload",
+          "Select a company before uploading reports.",
+        ),
+      );
+    }
+
+    if (!window?.electronAPI?.navigateToCompany) {
+      return quickCompanyContext;
+    }
+
+    const result = await window.electronAPI.navigateToCompany(
+      quickCompanyContext,
+    );
+    if (result?.status !== "SUCCESS") {
+      throw new Error(
+        result?.error ||
+          translate(
+            "messages.error.companyRequiredForUpload",
+            "Select a company before uploading reports.",
+          ),
+      );
+    }
+
+    return result.selectedCompany || quickCompanyContext;
+  }, [quickCompanyContext, translate]);
+
+  const waitForQuickTaqeemBrowserReady = useCallback(async () => {
+    if (!window?.electronAPI?.checkStatus) return null;
+
+    const readStatus = async () => {
+      const status = await window.electronAPI.checkStatus();
+      return {
+        status,
+        ready: isTaqeemBrowserReadyStatus(status),
+      };
+    };
+
+    let current = await readStatus();
+    if (current.ready) return current.status;
+
+    if (window?.electronAPI?.openTaqeemLogin) {
+      const openResult = await window.electronAPI.openTaqeemLogin({
+        url: TAQEEM_HOME_URL,
+        automationOnly: true,
+        openInAutomation: true,
+        onlyIfClosed: false,
+        navigateIfOpen: true,
+        skipStatusCheck: true,
+        preferChrome: false,
+      });
+
+      if (openResult?.status !== "SUCCESS") {
+        throw new Error(openResult?.error || "Failed to open Taqeem browser.");
+      }
+
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < TAQEEM_BROWSER_READY_TIMEOUT_MS) {
+        current = await readStatus();
+        if (current.ready) return current.status;
+        await new Promise((resolve) =>
+          setTimeout(resolve, TAQEEM_BROWSER_READY_POLL_MS),
+        );
+      }
+    }
+
+    const status = current?.status || {};
+    throw new Error(
+      status?.error ||
+        translate(
+          "messages.error.taqeemBrowserOff",
+          "Taqeem connection is off. Turn Taqeem connection on, then retry.",
+        ),
+    );
+  }, [translate]);
+
   /** Same Taqeem/session/electron gate as ElRajhi before uploads and desktop actions. */
   const ensureQuickUploadActionReady = useCallback(
-    async (authTokenOverride = null) => {
-      if (!selectedCompanyOfficeId) {
+    async () => {
+      if (!quickCompanyContext) {
         throw new Error(
           translate(
             "messages.error.companyRequiredForUpload",
@@ -948,95 +1052,21 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
         );
       }
 
-      const tokenForAuth = authTokenOverride ?? token;
-      const guestForAuth = isGuest || !tokenForAuth;
-      const officeIdForAuth =
-        selectedCompany?.officeId || selectedCompany?.office_id || null;
-
-      const authStatus = await ensureTaqeemAuthorized(
-        tokenForAuth,
-        onViewChange,
-        taqeemStatus?.state === "success",
-        0,
-        login,
-        setTaqeemStatus,
-        {
-          isGuest: guestForAuth,
-          guestAccessEnabled: systemState?.guestAccessEnabled ?? true,
-          cachedUser: user || null,
-          selectedCompanyOfficeId: officeIdForAuth,
-          disableAppAuthRedirects: true,
-        },
-      );
-
-      if (authStatus?.status === "INSUFFICIENT_POINTS") {
-        setShowInsufficientPointsModal(true);
-        throw new Error(
-          authStatus?.message ||
-            authStatus?.reason ||
-            translate(
-              "messages.error.insufficientPoints",
-              "You don't have enough points for this action.",
-            ),
-        );
-      }
-
-      if (authStatus?.status === "LOGIN_REQUIRED") {
-        throw new Error(
-          translate(
-            "messages.error.taqeemLoginRequired",
-            "Taqeem login required. Finish login and choose a company to continue.",
-          ),
-        );
-      }
-
-      if (!isTaqeemAuthSuccess(authStatus)) {
-        throw new Error(
-          getTaqeemAuthErrorMessage(
-            authStatus,
-            translate(
-              "messages.error.taqeemLoginRequired",
-              "Taqeem login required. Finish login and choose a company to continue.",
-            ),
-          ),
-        );
-      }
+      await persistQuickCompanyContext();
 
       if (!window?.electronAPI?.checkStatus) {
-        return authStatus;
+        return true;
       }
 
-      const status = await window.electronAPI.checkStatus();
-      const statusCode = String(status?.status || "").toUpperCase();
-      const isReady = Boolean(
-        status?.browserOpen && statusCode.includes("SUCCESS"),
-      );
+      await waitForQuickTaqeemBrowserReady();
 
-      if (!isReady) {
-        throw new Error(
-          status?.error ||
-            translate(
-              "messages.error.taqeemBrowserOff",
-              "Taqeem connection is off. Turn Taqeem connection on, then retry.",
-            ),
-        );
-      }
-
-      return authStatus;
+      return true;
     },
     [
-      isGuest,
-      login,
-      onViewChange,
-      selectedCompany,
-      selectedCompanyOfficeId,
-      setShowInsufficientPointsModal,
-      setTaqeemStatus,
-      systemState?.guestAccessEnabled,
-      taqeemStatus?.state,
-      token,
+      persistQuickCompanyContext,
+      quickCompanyContext,
       translate,
-      user,
+      waitForQuickTaqeemBrowserReady,
     ],
   );
 
@@ -1082,40 +1112,13 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
   const handleExcelChange = (e) => {
     const files = Array.from(e.target.files || []);
     setExcelFiles(files);
+    setPdfFiles([]);
+    setPdfPathMap({});
+    setWantsPdfUpload(false);
     resetMessages();
     if (excelInputRef?.current) {
       excelInputRef.current.value = null;
     }
-  };
-
-  const handlePdfChange = async (e) => {
-    const files = Array.from(e.target.files || []);
-
-    // Check for oversized files
-    const oversizedFiles = files.filter((file) => file.size > MAX_PDF_SIZE);
-    if (oversizedFiles.length > 0) {
-      const oversizedNames = oversizedFiles.map((f) => f.name).join(", ");
-      setError(
-        translate(
-          "messages.error.pdfSizeLimit",
-          "PDF file(s) exceed 20 MB limit: {{files}}",
-          { files: oversizedNames },
-        ),
-      );
-      return;
-    }
-
-    setPdfFiles(files);
-
-    // Get absolute paths for the selected PDFs
-    if (files.length > 0) {
-      const paths = await getAbsolutePaths(files);
-      setPdfPathMap(paths);
-    } else {
-      setPdfPathMap({});
-    }
-
-    resetMessages();
   };
 
   // Add this function after the existing helper functions (around line 300)
@@ -1240,28 +1243,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       );
       return;
     }
-    if (wantsPdfUpload && pdfFiles.length === 0) {
-      setError(
-        translate(
-          "messages.error.selectPdfFile",
-          "Please select at least one PDF file or disable PDF upload.",
-        ),
-      );
-      return;
-    }
-    if (
-      wantsPdfUpload &&
-      (pdfMatchInfo.excelsMissingPdf.length ||
-        pdfMatchInfo.unmatchedPdfs.length)
-    ) {
-      setError(
-        translate(
-          "messages.error.pdfNamesMismatch",
-          "PDF filenames must match the Excel filenames.",
-        ),
-      );
-      return;
-    }
     if (!isReadyToUpload) {
       setError(
         translate(
@@ -1280,15 +1261,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
 
           await ensureQuickUploadActionReady(authToken);
 
-          if (!extractTaqeemUsernameFromUser(user || {})) {
-            throw new Error(
-              translate(
-                "messages.error.taqeemRequiredForUpload",
-                "Log in to Taqeem and link your account before uploading reports.",
-              ),
-            );
-          }
-
           if (!authToken) {
             throw new Error(
               translate(
@@ -1306,17 +1278,12 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
             ),
           );
 
-          let pdfPaths = {};
-          if (wantsPdfUpload && pdfFiles.length > 0) {
-            pdfPaths = await getAbsolutePaths(pdfFiles, false);
-          } else {
-            pdfPaths = await getAbsolutePaths([], true, excelFiles);
-          }
+          const pdfPaths = await getAbsolutePaths([], true, excelFiles);
 
           const data = await submitReportsQuicklyUpload(
             excelFiles,
-            wantsPdfUpload ? pdfFiles : [],
-            !wantsPdfUpload,
+            [],
+            true,
             selectedCompanyOfficeId || null,
             pdfPaths,
           );
@@ -1495,27 +1462,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     }
   };
 
-  const openPdfPicker = useCallback(() => {
-    if (pdfInputRef?.current) {
-      pdfInputRef.current.value = null;
-      pdfInputRef.current.click();
-    }
-  }, []);
-
-  const handlePdfToggle = (checked, options = {}) => {
-    const { openPicker = false } = options;
-    setWantsPdfUpload(checked);
-    if (!checked) {
-      setPdfFiles([]);
-      setPdfPathMap({});
-    } else if (openPicker && (!wantsPdfUpload || pdfFiles.length === 0)) {
-      setTimeout(() => {
-        openPdfPicker();
-      }, 0);
-    }
-    resetMessages();
-  };
-
   const resetMessages = () => {
     setError("");
     setSuccess("");
@@ -1578,7 +1524,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
           return [];
         }
 
-        if (!extractTaqeemUsernameFromUser(user || {}) || !selectedCompanyOfficeId) {
+        if (!selectedCompanyOfficeId) {
           setReports([]);
           setReportsPagination({
             page: 1,
@@ -2068,7 +2014,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       setValidationModalStep("validation");
     }
 
-    const shouldValidatePdf = wantsPdfUpload && pdfFiles.length > 0;
+    const shouldValidatePdf = false;
 
     const performValidation = async () => {
       const results = [];
@@ -2363,14 +2309,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
 
   const isReadyToUpload = useMemo(() => {
     if (excelFiles.length === 0) return false;
-    if (wantsPdfUpload && pdfFiles.length === 0) return false;
-    if (
-      wantsPdfUpload &&
-      (pdfMatchInfo.excelsMissingPdf.length ||
-        pdfMatchInfo.unmatchedPdfs.length)
-    ) {
-      return false;
-    }
     if (validating) return false;
     if (!validationItems.length) return false;
     const anyIssues = validationItems.some(
@@ -2380,11 +2318,8 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
     return true;
   }, [
     excelFiles.length,
-    pdfFiles.length,
-    wantsPdfUpload,
     validating,
     validationItems,
-    pdfMatchInfo,
   ]);
 
   const handleUpload = async () => {
@@ -2395,28 +2330,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
         translate(
           "messages.error.selectExcelFile",
           "Please select at least one Excel file",
-        ),
-      );
-      return;
-    }
-    if (wantsPdfUpload && pdfFiles.length === 0) {
-      setError(
-        translate(
-          "messages.error.selectPdfFile",
-          "Please select at least one PDF file or disable PDF upload.",
-        ),
-      );
-      return;
-    }
-    if (
-      wantsPdfUpload &&
-      (pdfMatchInfo.excelsMissingPdf.length ||
-        pdfMatchInfo.unmatchedPdfs.length)
-    ) {
-      setError(
-        translate(
-          "messages.error.pdfNamesMismatch",
-          "PDF filenames must match the Excel filenames.",
         ),
       );
       return;
@@ -2439,15 +2352,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
 
           await ensureQuickUploadActionReady(authToken);
 
-          if (!extractTaqeemUsernameFromUser(user || {})) {
-            throw new Error(
-              translate(
-                "messages.error.taqeemRequiredForUpload",
-                "Log in to Taqeem and link your account before uploading reports.",
-              ),
-            );
-          }
-
           if (!authToken) {
             throw new Error(
               translate(
@@ -2465,17 +2369,12 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
             ),
           );
 
-          let pdfPaths = {};
-          if (wantsPdfUpload && pdfFiles.length > 0) {
-            pdfPaths = await getAbsolutePaths(pdfFiles, false);
-          } else {
-            pdfPaths = await getAbsolutePaths([], true, excelFiles);
-          }
+          const pdfPaths = await getAbsolutePaths([], true, excelFiles);
 
           const data = await submitReportsQuicklyUpload(
             excelFiles,
-            wantsPdfUpload ? pdfFiles : [],
-            !wantsPdfUpload,
+            [],
+            true,
             selectedCompanyOfficeId || null,
             pdfPaths,
           );
@@ -2590,6 +2489,9 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
 
   const openValidationModal = useCallback(() => {
     if (!excelFiles.length) return;
+    setPdfFiles([]);
+    setPdfPathMap({});
+    setWantsPdfUpload(false);
     setValidationModalStep("validation");
     setShowValidationModal(true);
   }, [excelFiles.length]);
@@ -2931,7 +2833,10 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       if (forceSelection && selectedCompany) {
         await setSelectedCompany(null, { skipNavigation: true, quiet: true });
       }
-      if (!forceSelection && selectedCompany) return selectedCompany;
+      if (!forceSelection && selectedCompany) {
+        await persistQuickCompanyContext();
+        return selectedCompany;
+      }
 
       let list = companies;
       try {
@@ -2997,6 +2902,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       companies,
       ensureCompaniesLoaded,
       preferredCompany,
+      persistQuickCompanyContext,
       replaceCompanies,
       selectedCompany,
       setCompanyStatus,
@@ -3171,6 +3077,8 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
           throw new Error("Desktop integration unavailable. Restart the app.");
         }
 
+        await persistQuickCompanyContext();
+
         const result = await window.electronAPI.createReportById(
           recordId,
           resolvedTabs,
@@ -3295,6 +3203,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
       login,
       loadReports,
       onViewChange,
+      persistQuickCompanyContext,
       reports,
       selectedCompanyOfficeId,
       token,
@@ -3347,6 +3256,7 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
           const meta = reportMetaById?.[recordId] || {};
           const result = await submitToTaqeem(recordId, resolvedTabs, {
             withLoading: false,
+            skipAuth: true,
             resume: resume || index > startIndex,
             assetCountOverride: meta?.assetCount,
             batchIdOverride: meta?.batchId,
@@ -4316,14 +4226,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
                 />
               </label>
             </div>
-            <input
-              ref={pdfInputRef}
-              type="file"
-              multiple
-              accept=".pdf"
-              className="hidden"
-              onChange={handlePdfChange}
-            />
             <button
               type="button"
               onClick={openValidationModal}
@@ -4343,9 +4245,6 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
                 resetMessages();
                 if (excelInputRef?.current) {
                   excelInputRef.current.value = null;
-                }
-                if (pdfInputRef?.current) {
-                  pdfInputRef.current.value = null;
                 }
               }}
               className="group inline-flex min-h-[44px] min-w-[94px] w-auto items-center justify-center gap-1.5 rounded-xl border border-slate-300 bg-white px-2 text-[10px] font-semibold text-slate-700 shadow-sm transition-all hover:-translate-y-[1px] hover:border-slate-400 hover:bg-slate-50"
@@ -6002,10 +5901,10 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
                           </div>
                         </div>
 
-                        <div className="rounded-2xl border border-slate-200 bg-white px-4 py-4 shadow-sm space-y-3">
+                        <div className="rounded-2xl border border-amber-200 bg-amber-50/70 px-4 py-4 shadow-sm space-y-3">
                           <div className="flex flex-wrap items-start justify-between gap-2">
                             <div>
-                              <span className="mb-1 inline-flex items-center rounded-full border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                              <span className="mb-1 inline-flex items-center rounded-full border border-amber-300 bg-white/80 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
                                 {translate(
                                   "validationModal.step2.pdfSection.badgeOptional",
                                   "Step 3 (Optional)",
@@ -6015,151 +5914,51 @@ const SubmitReportsQuickly = ({ onViewChange }) => {
                                 <Files className="w-3.5 h-3.5 text-blue-600" />
                                 {translate(
                                   "validationModal.step2.pdfSection.title",
-                                  "Step 3: PDF attachment (optional)",
+                                  "Step 3: Use placeholder PDF",
                                 )}
                               </div>
                               <p className="mt-1 text-[11px] text-slate-600">
                                 {translate(
                                   "validationModal.step2.pdfSection.subtitle",
-                                  "Choose to upload matching PDFs now, or skip and use the placeholder automatically.",
+                                  "PDF upload from the app is disabled. The app will use the placeholder PDF automatically.",
                                 )}
                               </p>
                             </div>
-                            <span
-                              className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
-                                wantsPdfUpload
-                                  ? "border-blue-200 bg-blue-50 text-blue-700"
-                                  : "border-emerald-200 bg-emerald-50 text-emerald-700"
-                              }`}
-                            >
-                              {wantsPdfUpload
-                                ? translate(
-                                    "validationModal.step2.pdfSection.modeUpload",
-                                    "Upload mode",
-                                  )
-                                : translate(
-                                    "validationModal.step2.pdfSection.modePlaceholder",
-                                    "Placeholder mode",
-                                  )}
+                            <span className="rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                              {translate(
+                                "validationModal.step2.pdfSection.modePlaceholder",
+                                "Placeholder mode",
+                              )}
                             </span>
                           </div>
 
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                            <button
-                              type="button"
-                              onClick={() => handlePdfToggle(false)}
-                              className={`rounded-xl border px-3 py-2 text-left transition-colors ${
-                                !wantsPdfUpload
-                                  ? "border-emerald-300 bg-emerald-50"
-                                  : "border-slate-200 bg-slate-50 hover:border-slate-300"
-                              }`}
-                            >
-                              <div className="text-xs font-semibold text-slate-800">
-                                {translate(
-                                  "validationModal.step2.pdfSection.usePlaceholder",
-                                  "Use placeholder PDF",
-                                )}
+                          <div className="rounded-xl border border-amber-300 bg-white px-3 py-3 text-amber-800">
+                            <div className="flex items-start gap-2">
+                              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                              <div>
+                                <div className="text-xs font-semibold">
+                                  {translate(
+                                    "validationModal.step2.pdfSection.taqeemNoticeTitle",
+                                    "PDF upload must be completed in Taqeem",
+                                  )}
+                                </div>
+                                <p className="mt-1 text-[11px] leading-5">
+                                  {translate(
+                                    "validationModal.step2.pdfSection.taqeemNotice",
+                                    "After creating the reports, update the report data in Taqeem and upload the actual report PDF directly from the Taqeem system.",
+                                  )}
+                                </p>
                               </div>
-                              <p className="mt-1 text-[10px] text-slate-600">
-                                {translate(
-                                  "validationModal.step2.pdfSection.usePlaceholderHint",
-                                  "Skip manual PDF upload and use the built-in placeholder file.",
-                                )}
-                              </p>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                handlePdfToggle(true, { openPicker: true })
-                              }
-                              className={`rounded-xl border px-3 py-2 text-left transition-colors ${
-                                wantsPdfUpload
-                                  ? "border-blue-300 bg-blue-50"
-                                  : "border-slate-200 bg-slate-50 hover:border-slate-300"
-                              }`}
-                            >
-                              <div className="text-xs font-semibold text-slate-800">
-                                {translate(
-                                  "validationModal.step2.pdfSection.uploadPdfs",
-                                  "Upload PDFs",
-                                )}
-                              </div>
-                              <p className="mt-1 text-[10px] text-slate-600">
-                                {translate(
-                                  "validationModal.step2.pdfSection.uploadPdfsHint",
-                                  "Upload PDF files with names matching each Excel filename.",
-                                )}
-                              </p>
-                            </button>
+                            </div>
                           </div>
 
-                          {wantsPdfUpload ? (
-                            <div className="rounded-xl border border-blue-200 bg-blue-50/60 px-3 py-3 space-y-2">
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <span className="text-[11px] font-medium text-blue-800">
-                                  {pdfFiles.length
-                                    ? translate(
-                                        "filePicker.selectedPdfs",
-                                        "{{count}} file(s) selected",
-                                        { count: pdfFiles.length },
-                                      )
-                                    : translate(
-                                        "filePicker.choosePdfFiles",
-                                        "Choose PDF files",
-                                      )}
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={openPdfPicker}
-                                  className="inline-flex items-center gap-1 rounded-md border border-blue-300 bg-white px-2 py-1 text-[10px] font-semibold text-blue-700 hover:bg-blue-100"
-                                >
-                                  {translate(
-                                    "validationModal.step2.pdfSection.chooseButton",
-                                    "Choose PDFs",
-                                  )}
-                                </button>
-                              </div>
-                              {pdfFiles.length > 0 && (
-                                <div className="rounded-lg border border-blue-100 bg-white/80 px-2 py-1.5 text-[10px] text-slate-700">
-                                  {pdfFiles
-                                    .slice(0, 4)
-                                    .map((file) => file.name)
-                                    .join(", ")}
-                                  {pdfFiles.length > 4
-                                    ? translate(
-                                        "validationModal.step2.pdfSection.moreFiles",
-                                        "+{{count}} more",
-                                        { count: pdfFiles.length - 4 },
-                                      )
-                                    : ""}
-                                </div>
-                              )}
-                              {pdfMatchInfo.excelsMissingPdf.length > 0 ||
-                              pdfMatchInfo.unmatchedPdfs.length > 0 ? (
-                                <div className="rounded-lg border border-rose-200 bg-rose-50 px-2 py-1.5 text-[10px] text-rose-700">
-                                  {translate(
-                                    "validationModal.step2.pdfSection.matchWarning",
-                                    "Some PDF filenames do not match Excel filenames.",
-                                  )}
-                                </div>
-                              ) : pdfFiles.length > 0 ? (
-                                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-2 py-1.5 text-[10px] text-emerald-700">
-                                  {translate(
-                                    "validationModal.step2.pdfSection.matchSuccess",
-                                    "All selected PDFs match Excel filenames.",
-                                  )}
-                                </div>
-                              ) : null}
-                            </div>
-                          ) : (
-                            <div className="rounded-xl border border-emerald-200 bg-emerald-50/70 px-3 py-2 text-[11px] text-emerald-700">
-                              {translate(
-                                "filePicker.willUseDummyPdf",
-                                "Will use {{placeholder}}",
-                                { placeholder: DUMMY_PDF_NAME },
-                              )}
-                            </div>
-                          )}
+                          <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 px-3 py-2 text-[11px] font-medium text-emerald-700">
+                            {translate(
+                              "filePicker.willUseDummyPdf",
+                              "Will use {{placeholder}}",
+                              { placeholder: DUMMY_PDF_NAME },
+                            )}
+                          </div>
                         </div>
 
                         {!isReadyToUpload && (

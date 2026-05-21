@@ -95,11 +95,11 @@ const setElectronCookieForBaseUrl = async (baseUrl, cookieObj) => {
   }
 };
 
-/** Max-Age (seconds) for refresh cookie when mirroring body.refreshToken (align with backend default). */
+/** Max-Age (seconds) for refresh cookie when mirroring body.refreshToken. */
 const REFRESH_TOKEN_MAX_AGE_SEC =
   (() => {
     const d = Number(process.env.REFRESH_COOKIE_DAYS);
-    const days = Number.isFinite(d) && d > 0 ? d : 365 * 100;
+    const days = Number.isFinite(d) && d > 0 ? d : 1;
     return days * 24 * 60 * 60;
   })();
 
@@ -128,12 +128,12 @@ const packageHandlers = {
     }
 
     const candidates = [];
-    const envUrl = process.env.BACKEND_URL;
+    const envUrl = process.env.BACKEND_URL || process.env.REACT_APP_BACKEND_URL;
     if (envUrl) candidates.push(envUrl.replace(/\/$/, ""));
 
     candidates.push(
-      "http://localhost:3000",
-      "http://127.0.0.1:3000",
+      "http://localhost:3001",
+      "http://127.0.0.1:3001",
     );
 
     const sleep = (ms) => new Promise((res) => setTimeout(res, ms));

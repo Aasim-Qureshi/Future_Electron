@@ -1,4 +1,7 @@
-const SUPER_ADMIN_PHONE = "000";
+const SUPER_ADMIN_PHONE = String(
+  (typeof process !== "undefined" && process?.env?.REACT_APP_SUPER_ADMIN_PHONE) ||
+    "000",
+).trim();
 
 /** @deprecated Single-mode app: no extra view restrictions */
 const ADMIN_ONLY_VIEW_IDS = new Set();

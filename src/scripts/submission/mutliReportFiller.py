@@ -165,7 +165,7 @@ async def find_record_in_collections(id, collection_names):
     print("record_data", record_data)
     record = record_data.get("data")
     if record:
-        return record, "multiapproachreports"
+        return record, record_data.get("collection") or "multiapproachreports"
     return None, None
 
 
@@ -342,8 +342,26 @@ async def create_report_for_record(
                 valuers.append({"valuerName": name, "percentage": pct or 0})
         record["valuers"] = valuers
 
-        # Open the initial create-report page
-        main_page = await browser.get(create_url)
+        emit_progress_update(
+            record_id,
+            1,
+            "Opening Taqeem report creation page...",
+            "processing",
+        )
+
+        # Open the initial create-report page. If Taqeem does not respond, fail
+        # the command instead of leaving the renderer stuck in a loading state.
+        try:
+            main_page = await asyncio.wait_for(browser.get(create_url), timeout=90)
+        except asyncio.TimeoutError:
+            await http_patch(
+                f"new-scripts/update-report-timestamp/{record['_id']}",
+                json={"type": "endSubmitTime"},
+            )
+            return {
+                "status": "FAILED",
+                "error": "Timed out opening Taqeem report creation page.",
+            }
         await asyncio.sleep(1)
 
         # Track if assets were created in step 2
@@ -768,7 +786,6 @@ async def create_new_report(browser, record_id, tabs_num=3):
 
 async def retry_create_new_report(browser, record_id, tabs_num=3):
     """Retry creating a report by only processing assets with submitState == 0"""
-    new_browser = None
     try:
         # Convert record_id to string if needed
         record_id_str = str(record_id).strip()
@@ -812,9 +829,8 @@ async def retry_create_new_report(browser, record_id, tabs_num=3):
         if not asset_data:
             return {"status": "SUCCESS", "message": "No assets found"}
 
-        new_browser = await spawn_new_browser(browser)
         # Filter retryable assets (submitState == 0)
-        validation_result = await validate_for_retry(new_browser, report_id, asset_data)
+        validation_result = await validate_for_retry(browser, report_id, asset_data)
 
         if validation_result["status"] == "RE-GRABBED":
             record, collection = await find_record_in_collections(
@@ -859,8 +875,6 @@ async def retry_create_new_report(browser, record_id, tabs_num=3):
         # Create a shallow copy of record with filtered assets
         retry_record = {**record, "asset_data": retry_assets}
 
-        # Spawn new browser for retry
-
         # Calculate base progress (report already created = 15%)
         base_progress = 15
         asset_fill_base = 85
@@ -880,7 +894,7 @@ async def retry_create_new_report(browser, record_id, tabs_num=3):
 
         # Process retry assets using handle_macro_edits
         result = await handle_macro_edits(
-            new_browser,
+            browser,
             retry_record,
             tabs_num=tabs_num,
             record_id=record_id_str,
@@ -922,10 +936,6 @@ async def retry_create_new_report(browser, record_id, tabs_num=3):
             "error": str(e),
             "traceback": traceback.format_exc(),
         }
-
-    finally:
-        if new_browser:
-            new_browser.stop()
 
 
 async def create_reports_by_batch(browser, batch_id, tabs_num=3):

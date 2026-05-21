@@ -57,12 +57,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
   setRefreshToken: (token, opts = {}) => {
     const payload = Object.assign(
       {
-        baseUrl: opts.baseUrl || "http://localhost:3000",
+        baseUrl: opts.baseUrl || "http://localhost:3001",
         token,
         name: opts.name || "refreshToken",
         path: opts.path || "/",
         maxAgeDays:
-          typeof opts.maxAgeDays === "number" ? opts.maxAgeDays : 365 * 100,
+          typeof opts.maxAgeDays === "number" ? opts.maxAgeDays : 1,
         sessionOnly: opts.sessionOnly === true,
         sameSite: opts.sameSite || "lax",
         secure:
@@ -78,7 +78,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   clearRefreshToken: (opts = {}) => {
     const payload = {
-      baseUrl: opts.baseUrl || "http://localhost:3000",
+      baseUrl: opts.baseUrl || "http://localhost:3001",
       name: opts.name || "refreshToken",
     };
     return safeInvoke("auth-clear-refresh-token", payload);

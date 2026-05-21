@@ -188,8 +188,19 @@ async def _process_one_command(cmd):
     if action == "close":
         await _run_close_command(cmd)
         return
-    # check-status must stay responsive while long jobs (e.g. certificate download) hold the lock.
+    # Do not inspect the shared browser while a heavy automation job owns it.
+    # This keeps navbar polling from interrupting quick-submit form filling.
     if action == "check-status":
+        if _command_serial_lock.locked():
+            result = {
+                "status": "SUCCESS",
+                "message": "Taqeem automation is running; preserving current browser session.",
+                "browserOpen": True,
+                "automationBusy": True,
+                "commandId": cmd.get("commandId"),
+            }
+            print(json.dumps(result), flush=True)
+            return
         await _run_command_safe(cmd)
         return
     # Secondary Taqeem approvals use a separate Chrome profile; must not block primary automation.
@@ -1119,8 +1130,9 @@ async def handle_command(cmd):
         print(json.dumps(result), flush=True)
 
     elif action == "create-report-by-id":
-        # Spawn a new browser for each report submission (like create-reports-by-batch)
-        new_browser = None
+        # Quick-submit must run in the already-open primary Taqeem browser.
+        # A temporary/headless browser can stall while restoring cookies and gives
+        # no visible action to the user, so keep this path direct and simple.
         process_id = None
         result = None
 
@@ -1143,17 +1155,15 @@ async def handle_command(cmd):
                     message="Preparing browser session for report submission...",
                 )
 
-            # Get the existing browser first, then spawn a new one from it
             browser = await get_browser()
-            new_browser = await spawn_new_browser(browser)
             if process_id:
                 emit_progress(
                     process_id,
                     current_item="browser_ready",
-                    message="Browser ready. Starting report submission workflow...",
+                    message="Using the open Taqeem browser. Starting report submission workflow...",
                 )
 
-            result = await create_new_report(new_browser, record_id, tabs_num)
+            result = await create_new_report(browser, record_id, tabs_num)
         except Exception as e:
             result = {
                 "status": "FAILED",
@@ -1161,9 +1171,6 @@ async def handle_command(cmd):
                 "traceback": traceback.format_exc(),
             }
         finally:
-            # Close the browser after completion
-            if new_browser:
-                new_browser.stop()
             if process_id:
                 clear_process(process_id)
 

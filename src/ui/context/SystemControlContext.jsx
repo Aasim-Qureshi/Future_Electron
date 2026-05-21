@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useState, useCallback } fr
 import { useSession } from './SessionContext';
 import navigation from '../constants/navigation';
 import { useTranslation } from 'react-i18next';
-import { ADMIN_ONLY_VIEW_IDS } from '../utils/viewAccess';
+import { ADMIN_ONLY_VIEW_IDS, isSuperAdminUser } from '../utils/viewAccess';
 
 const { valueSystemGroups } = navigation;
 
@@ -68,7 +68,7 @@ export const SystemControlProvider = ({ children }) => {
     const [error, setError] = useState(null);
     const [autoActivating, setAutoActivating] = useState(false);
 
-    const isAdmin = user?.phone === '000';
+    const isAdmin = isSuperAdminUser(user);
     const isAuthenticated = !!user;
 
     const fetchSystemState = useCallback(async () => {

@@ -3,7 +3,7 @@ const axios = require("axios");
 const defaultBase =
   (typeof process !== "undefined" && process?.env?.REACT_APP_BACKEND_URL) ||
   (typeof process !== "undefined" && process?.env?.BACKEND_URL) ||
-  "http://localhost:3000";
+  "http://localhost:3001";
 
 const httpClient = axios.create({
   baseURL: `${String(defaultBase).replace(/\/$/, "")}/api`,

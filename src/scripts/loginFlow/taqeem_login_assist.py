@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any
 
 from scripts.loginFlow.taqeem_primary_credentials import (
     TAQEEM_PRIMARY_LOGIN_ID,
     TAQEEM_PRIMARY_PASSWORD,
+)
+
+TAQEEM_PRIMARY_AUTOFILL = os.getenv("TAQEEM_PRIMARY_AUTOFILL", "").lower() in (
+    "1",
+    "true",
+    "yes",
 )
 
 
@@ -65,7 +72,7 @@ def primary_login_assist_js(login_id: str, password: str) -> str:
     titleWrap.appendChild(title);
     var line = document.createElement('div');
     line.style.marginTop = '6px';
-    line.textContent = 'الهوية / الإقامة / البريد: ' + LOGIN_ID + ' — كلمة المرور: ' + PASSWORD;
+    line.textContent = 'الهوية / الإقامة / البريد: ' + LOGIN_ID + ' — كلمة المرور: ' + (PASSWORD ? '••••••••' : '');
     var hint = document.createElement('div');
     hint.style.marginTop = '6px';
     hint.style.fontSize = '12px';
@@ -83,6 +90,8 @@ def primary_login_assist_js(login_id: str, password: str) -> str:
 
 async def apply_taqeem_primary_login_assist(page: Any) -> None:
     if page is None:
+        return
+    if not TAQEEM_PRIMARY_AUTOFILL:
         return
     if not TAQEEM_PRIMARY_LOGIN_ID or not TAQEEM_PRIMARY_PASSWORD:
         return

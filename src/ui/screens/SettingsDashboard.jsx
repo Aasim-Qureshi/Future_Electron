@@ -10,7 +10,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useSession, LOCAL_APP_USER_PHONE } from "../context/SessionContext";
+import { useSession } from "../context/SessionContext";
 import { useSystemControl } from "../context/SystemControlContext";
 import { useRam, calculateRecommendedTabs } from "../context/RAMContext";
 import { useValueNav } from "../context/ValueNavContext";
@@ -547,12 +547,7 @@ const SettingsDashboard = ({ onViewChange }) => {
         </div>
 
         <p className="mt-10 text-center text-[11px] text-stone-400">
-          {String(user?.phone ?? "") === LOCAL_APP_USER_PHONE ||
-          String(user?.id ?? "") === LOCAL_APP_USER_PHONE
-            ? t("layout.nav.fixedAppUser")
-            : isGuest
-              ? t("layout.auth.guest")
-              : user?.phone || user?.id || "—"}
+          {isGuest ? t("layout.auth.guest") : user?.phone || user?.id || "—"}
         </p>
       </div>
     </div>
